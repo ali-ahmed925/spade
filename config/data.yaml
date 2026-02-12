@@ -1,0 +1,34 @@
+# ── Dataset ──
+dataset:
+  name: "mvtec"
+  root: "./datasets/mvtec_anomaly_detection"
+  category: "screw"                      # single category or "all"
+  image_size: 224
+  num_workers: 4
+
+# ── Synthetic Anomaly Generation ──
+synthetic:
+  enabled: true
+  synthetic_prob: 0.2                     # train split: probability of applying synthetic anomaly
+  methods:
+    - "cutpaste"
+    - "perlin"
+  cutpaste:
+    area_ratio: [0.02, 0.15]
+    aspect_ratio: [0.3, 3.3]
+  perlin:
+    min_scale: 0
+    max_scale: 6
+    threshold: 0.5
+
+# ── Validation from normal-only train split (no real test leakage) ──
+validation:
+  enabled: true
+  source: "train_good"
+  size: 40                                # number of images held out from train/good
+  seed: 42
+  synthetic_prob: 0.2                     # mix of clean + synthetic anomalies in val
+  synthetic_method: "cutpaste"            # or "perlin"
+
+
+

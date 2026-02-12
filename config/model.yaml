@@ -1,0 +1,18 @@
+# ── BLIP-2 Pretrained Backbone ──
+blip2:
+  model_name: "Salesforce/blip2-opt-2.7b"
+
+# ── Vision Transformer (derived from BLIP-2's ViT-G) ──
+vit:
+  image_size: 224
+  patch_size: 14                          # BLIP-2 ViT-G uses patch_size 14
+  num_patches: 256                        # (224/14)^2
+
+# ── Patch Anomaly Head ──
+patch_head:
+  hidden_dim: 256
+  dropout: 0.1
+
+# ── LLM Projection ──
+projection:
+  output_dim: 2560                        # must match LLM embed dim (Phi-2 = 2560)

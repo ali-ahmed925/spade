@@ -1,0 +1,32 @@
+# ── Training ──
+training:
+  epochs: 20
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  seed: 42
+  log_interval: 10                        # steps between log prints
+  save_interval: 5                        # epochs between checkpoint saves
+  checkpoint_dir: "./checkpoints"
+
+# ── Weights & Biases ──
+wandb:
+  enabled: true
+  project: "spade-anomaly-detection"
+  entity: null                            # your wandb username/team (or null)
+  name: null                               # run name (auto-generated if null)
+  tags: []
+  notes: null
+
+# ── Loss Weights ──
+loss:
+  patch_weight: 1.0
+  contrastive_weight: 0.5
+  use_focal: false
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+
+

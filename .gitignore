@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+
+# Conda
+.env
+*.env
+
+# Virtual environments
+venv/
+myn_again/
+
+# Data
+datasets/
+
+# Logs
+logs/
+
+# Models
+*.pth
+*.pt
+*.ckpt
+
+# OS
+.DS_Store
+
+#Debug
+debug_output/
+
+#results
+my_results/
+test_output/
+
+#wandb
+wandb/
