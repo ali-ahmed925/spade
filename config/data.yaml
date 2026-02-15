@@ -2,7 +2,7 @@
 dataset:
   name: "mvtec"
   root: "./datasets/mvtec_anomaly_detection"
-  category: "screw"                      # single category or "all"
+  category: "bottle"                      # single category or "all"
   image_size: 224
   num_workers: 4
 
@@ -10,16 +10,21 @@ dataset:
 synthetic:
   enabled: true
   synthetic_prob: 0.2                     # train split: probability of applying synthetic anomaly
-  methods:
-    - "cutpaste"
-    - "perlin"
+  # Methods are automatically selected based on category (see synthetic.py CATEGORY_METHODS)
+  # Available methods: "cutpaste", "crack"
   cutpaste:
     area_ratio: [0.02, 0.15]
     aspect_ratio: [0.3, 3.3]
-  perlin:
-    min_scale: 0
-    max_scale: 6
-    threshold: 0.5
+    blend_alpha: 0.7                       # blending factor (0.0 = full patch, 1.0 = full background)
+    color_jitter: 0.1                      # color matching strength
+  crack:
+    num_cracks: 3                          # number of main crack branches
+    min_length: 0.1                        # min length as fraction of image diagonal
+    max_length: 0.4                        # max length as fraction of image diagonal
+    min_width: 1                           # min crack width in pixels
+    max_width: 3                           # max crack width in pixels
+    darkness: 0.3                          # how dark the crack appears (0.0-1.0)
+    branching_prob: 0.3                    # probability of creating a branch
 
 # ── Validation from normal-only train split (no real test leakage) ──
 validation:
@@ -28,7 +33,7 @@ validation:
   size: 40                                # number of images held out from train/good
   seed: 42
   synthetic_prob: 0.2                     # mix of clean + synthetic anomalies in val
-  synthetic_method: "cutpaste"            # or "perlin"
+  synthetic_method: "cutpaste"            # or "crack" (auto-selected based on category if not specified)
 
 
 

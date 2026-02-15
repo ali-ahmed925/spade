@@ -34,7 +34,7 @@ class FocalLoss(nn.Module):
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
     """
 
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0) -> None:
+    def __init__(self, alpha: float = 0.25, gamma: float = 4.0) -> None:
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
@@ -58,6 +58,4 @@ class FocalLoss(nn.Module):
         alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
         focal_weight = alpha_t * (1 - p_t) ** self.gamma
         return (focal_weight * bce).mean()
-
-
 

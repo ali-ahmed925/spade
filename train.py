@@ -53,7 +53,7 @@ def train_one_epoch(
     # Keep ViT in eval mode (frozen + BatchNorm/Dropout behaviour)
     model.vision_encoder.eval()
 
-    running = {"total": 0.0, "patch": 0.0, "contrastive": 0.0}
+    running = {"total": 0.0, "patch": 0.0}
     num_batches = 0
     global_step = (epoch - 1) * len(loader)
 
@@ -99,7 +99,6 @@ def train_one_epoch(
                 wandb.log({
                     "train/loss_total": running["total"] / num_batches,
                     "train/loss_patch": running["patch"] / num_batches,
-                    "train/loss_contrastive": running["contrastive"] / num_batches,
                     "train/learning_rate": scheduler.get_last_lr()[0],
                     "train/gradient_norm": grad_norm,
                     "train/epoch": epoch,
@@ -184,14 +183,16 @@ def main() -> None:
         logger.info("Initialized Weights & Biases logging")
 
     # ── Train/Val split from train/good (normal-only) ──
+    # synthetic_method=None means auto-select based on category
     base_train = MVTecDataset(
         root=cfg["dataset"]["root"],
         category=cfg["dataset"]["category"],
         split="train",
         image_size=cfg["vit"]["image_size"],
         patch_size=cfg["vit"]["patch_size"],
-        synthetic_method=cfg["synthetic"]["methods"][0],
-        synthetic_prob=cfg["synthetic"].get("synthetic_prob", 0.5),
+        synthetic_method=None,  # Auto-select based on category
+        synthetic_prob=cfg["synthetic"].get("synthetic_prob", 0.2),
+        synthetic_cfg=cfg.get("synthetic", {}),
     )
 
     val_cfg = cfg.get("validation", {})
@@ -212,10 +213,11 @@ def main() -> None:
             split="train",
             image_size=cfg["vit"]["image_size"],
             patch_size=cfg["vit"]["patch_size"],
-            synthetic_method=cfg["synthetic"]["methods"][0],
-            synthetic_prob=cfg["synthetic"].get("synthetic_prob", 0.5),
+            synthetic_method=None,  # Auto-select based on category
+            synthetic_prob=cfg["synthetic"].get("synthetic_prob", 0.2),
             subset_indices=train_indices,
             deterministic=False,
+            synthetic_cfg=cfg.get("synthetic", {}),
         )
 
         val_dataset = MVTecDataset(
@@ -224,10 +226,11 @@ def main() -> None:
             split="train",
             image_size=cfg["vit"]["image_size"],
             patch_size=cfg["vit"]["patch_size"],
-            synthetic_method=val_cfg.get("synthetic_method", cfg["synthetic"]["methods"][0]),
-            synthetic_prob=float(val_cfg.get("synthetic_prob", 0.5)),
+            synthetic_method=val_cfg.get("synthetic_method", None),  # None = auto-select
+            synthetic_prob=float(val_cfg.get("synthetic_prob", 0.2)),
             subset_indices=val_indices,
             deterministic=True,
+            synthetic_cfg=cfg.get("synthetic", {}),
             base_seed=int(val_cfg.get("seed", 42)),
         )
     else:
@@ -285,7 +288,6 @@ def main() -> None:
     )
     criterion = TotalLoss(
         patch_weight=cfg["loss"]["patch_weight"],
-        contrastive_weight=cfg["loss"]["contrastive_weight"],
         use_focal=cfg["loss"]["use_focal"],
         focal_alpha=cfg["loss"]["focal_alpha"],
         focal_gamma=cfg["loss"]["focal_gamma"],
@@ -303,8 +305,7 @@ def main() -> None:
         logger.info(
             f"Epoch {epoch}/{tcfg['epochs']} — "
             f"loss: {metrics['total']:.4f} | "
-            f"patch: {metrics['patch']:.4f} | "
-            f"contrastive: {metrics['contrastive']:.4f}"
+            f"patch: {metrics['patch']:.4f}"
         )
 
         # ── Validation (synthetic from train/good to avoid test leakage) ──
@@ -322,7 +323,6 @@ def main() -> None:
             wandb.log({
                 "epoch/loss_total": metrics["total"],
                 "epoch/loss_patch": metrics["patch"],
-                "epoch/loss_contrastive": metrics["contrastive"],
                 "epoch/epoch": epoch,
                 "val/image_auroc": val_metrics["val/image_auroc"],
                 "val/patch_auroc": val_metrics["val/patch_auroc"],
