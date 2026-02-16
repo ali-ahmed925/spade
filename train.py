@@ -24,6 +24,7 @@ from optim.scheduler import build_scheduler
 from optim.regularizer import clip_gradients
 from utils.logging import get_logger
 from utils.seed import set_seed
+from utils.early_stopping import EarlyStopping
 
 
 def load_config() -> dict:
@@ -59,16 +60,24 @@ def train_one_epoch(
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
     for step, batch in enumerate(pbar):
+        # Clear cache periodically
+        if step > 0 and step % 5 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         images = batch["image"].to(device)               # (B, 3, H, W)
         patch_labels = batch["patch_labels"].to(device)   # (B, N)
         labels = batch["label"].to(device).long()        # (B,) 0=clean, 1=synthetic anomaly
 
-        # Forward
-        outputs = model(images)
+        # Forward with patch_labels for statistics update
+        outputs = model(
+            images,
+            patch_labels=patch_labels,
+            update_stats=True,  # Update normal statistics during training
+        )
 
-        # Loss
+        # Loss - now uses patch_scores instead of patch_logits
         losses = criterion(
-            patch_logits=outputs["patch_logits"],
+            patch_scores=outputs["patch_scores"],  # Changed from patch_logits
             patch_targets=patch_labels,
             query_embeds=outputs["query_embeds"],
             labels=labels,
@@ -85,6 +94,11 @@ def train_one_epoch(
         for k in running:
             running[k] += losses[k].item()
         num_batches += 1
+        
+        # Clear intermediate tensors
+        del outputs, losses
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         current_step = global_step + step + 1
 
         if (step + 1) % cfg["training"]["log_interval"] == 0:
@@ -126,9 +140,12 @@ def validate(
         labels = batch["label"].cpu().numpy().astype(np.int64)  # (B,)
         patch_labels = batch["patch_labels"].cpu().numpy().astype(np.float32)  # (B, N)
 
-        outputs = model(images)
-        patch_probs = torch.sigmoid(outputs["patch_logits"]).detach().cpu().numpy().astype(np.float32)  # (B, N)
-        image_scores = model.get_image_score(outputs["patch_logits"]).detach().cpu().numpy().astype(np.float32)  # (B,)
+        outputs = model(images)  # No update_stats in validation
+        # Normalize patch_scores for evaluation
+        patch_scores = outputs["patch_scores"]
+        normalized_scores = torch.sigmoid(torch.log1p(patch_scores))
+        patch_probs = normalized_scores.detach().cpu().numpy().astype(np.float32)  # (B, N)
+        image_scores = model.get_image_score(patch_scores).detach().cpu().numpy().astype(np.float32)  # (B,)
 
         all_image_labels.extend(labels.tolist())
         all_image_scores.extend(image_scores.tolist())
@@ -172,7 +189,9 @@ def main() -> None:
                 "model": cfg.get("blip2", {}),
                 "vit": cfg.get("vit", {}),
                 "qformer": cfg.get("qformer", {}),
-                "patch_head": cfg.get("patch_head", {}),
+                "hpa": cfg.get("hpa", {}),
+                "scoring": cfg.get("scoring", {}),
+                "normal_stats": cfg.get("normal_stats", {}),
                 "projection": cfg.get("projection", {}),
                 "dataset": cfg.get("dataset", {}),
                 "synthetic": cfg.get("synthetic", {}),
@@ -259,12 +278,33 @@ def main() -> None:
     else:
         val_loader = None
 
+    # ── Clear GPU memory before loading model ──
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        logger.info("Cleared GPU cache before model loading")
+    
     # ── Model ──
     model = SPADE(
         blip2_model_name=cfg["blip2"]["model_name"],
-        patch_head_hidden=cfg["patch_head"]["hidden_dim"],
-        patch_head_dropout=cfg["patch_head"]["dropout"],
         llm_embed_dim=cfg["projection"]["output_dim"],
+        # HPA parameters
+        hpa_n_max=cfg["hpa"]["n_max"],
+        hpa_n_min=cfg["hpa"]["n_min"],
+        hpa_t_steps=cfg["hpa"]["t_steps"],
+        hpa_w=cfg["hpa"]["w"],
+        hpa_p1=cfg["hpa"]["p1"],
+        hpa_p2=cfg["hpa"]["p2"],
+        # Scoring parameters
+        score_alpha=cfg["scoring"]["alpha"],
+        score_beta=cfg["scoring"]["beta"],
+        score_lambda=cfg["scoring"]["lambda"],
+        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
+        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
+        # Normal statistics parameters
+        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
+        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
     ).to(device)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -297,6 +337,18 @@ def main() -> None:
     os.makedirs(tcfg["checkpoint_dir"], exist_ok=True)
     best_val_image_auroc = -float("inf")
     best_epoch = -1
+    
+    # ── Early Stopping ──
+    early_stop_cfg = tcfg.get("early_stopping", {})
+    early_stopper = None
+    if early_stop_cfg.get("enabled", False) and val_loader is not None:
+        early_stopper = EarlyStopping(
+            patience=early_stop_cfg.get("patience", 10),
+            mode=early_stop_cfg.get("mode", "max"),
+            min_delta=early_stop_cfg.get("min_delta", 0.001),
+            verbose=True,
+        )
+        logger.info(f"Early stopping enabled: patience={early_stopper.patience}, mode={early_stopper.mode}")
 
     for epoch in range(1, tcfg["epochs"] + 1):
         metrics = train_one_epoch(
@@ -328,6 +380,16 @@ def main() -> None:
                 "val/patch_auroc": val_metrics["val/patch_auroc"],
             }, step=epoch * len(loader))
 
+        # ── Early Stopping Check ──
+        if early_stopper is not None and val_loader is not None:
+            current_score = val_metrics["val/image_auroc"]
+            if not np.isnan(current_score):
+                if early_stopper(current_score):
+                    logger.info(f"Early stopping triggered at epoch {epoch}")
+                    if use_wandb:
+                        wandb.log({"early_stopping/triggered": True, "early_stopping/epoch": epoch})
+                    break
+
         # Save checkpoint ONLY when validation improves (max score wins)
         current = val_metrics["val/image_auroc"]
         if val_loader is not None and (not np.isnan(current)) and current > best_val_image_auroc:
@@ -336,7 +398,7 @@ def main() -> None:
 
             trainable_state = {
                 k: v for k, v in model.state_dict().items()
-                if any(k.startswith(prefix) for prefix in ["qformer.", "patch_head.", "projection."])
+                if any(k.startswith(prefix) for prefix in ["qformer.", "projection.", "hpa.", "query_patch_attn.", "mahalanobis_scorer.", "normal_stats_tracker."])
             }
 
             best_path = os.path.join(tcfg["checkpoint_dir"], "spade_best.pt")
@@ -347,9 +409,10 @@ def main() -> None:
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": {
                     "blip2_model_name": cfg["blip2"]["model_name"],
-                    "patch_head_hidden": cfg["patch_head"]["hidden_dim"],
-                    "patch_head_dropout": cfg["patch_head"]["dropout"],
                     "llm_embed_dim": cfg["projection"]["output_dim"],
+                    "hpa": cfg["hpa"],
+                    "scoring": cfg["scoring"],
+                    "normal_stats": cfg["normal_stats"],
                 },
             }, best_path)
             logger.info(f"New best val/image_auroc={best_val_image_auroc:.4f} @ epoch {epoch} → saved {best_path}")

@@ -67,14 +67,14 @@ def save_localization_visualization(
     axes[1].set_title("Ground Truth Mask")
     axes[1].axis("off")
 
-    # Predicted heatmap
-    im = axes[2].imshow(heatmap, cmap="jet", vmin=0, vmax=1)
+    # Predicted heatmap (use 'hot' colormap for better visualization)
+    im = axes[2].imshow(heatmap, cmap="hot", vmin=0, vmax=1)
     axes[2].set_title("Predicted Heatmap")
     axes[2].axis("off")
     plt.colorbar(im, ax=axes[2], fraction=0.046)
 
-    # Overlay
-    overlay = overlay_heatmap(image_np, heatmap)
+    # Overlay (use 'hot' colormap)
+    overlay = overlay_heatmap(image_np, heatmap, colormap_name="hot")
     axes[3].imshow(overlay)
     axes[3].set_title("Overlay (Red = Anomaly)")
     axes[3].axis("off")
@@ -109,6 +109,7 @@ def evaluate(
     all_image_scores: list[float] = []
     all_masks: list[np.ndarray] = []
     all_heatmaps: list[np.ndarray] = []
+    all_image_info: list[dict] = []  # Store image paths and scores for detailed output
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluating")):
         images = batch["image"].to(device)
@@ -116,17 +117,48 @@ def evaluate(
         masks = batch["mask"]
         paths = batch["path"]
 
-        outputs = model(images)
-        patch_logits = outputs["patch_logits"]  # (B, N)
+        outputs = model(images)  # No update_stats in eval
+        patch_scores = outputs["patch_scores"]  # Changed from patch_logits
 
-        image_scores = model.get_image_score(patch_logits)
+        image_scores = model.get_image_score(patch_scores)
 
         for i in range(images.size(0)):
-            all_labels.append(int(labels[i]))
-            all_image_scores.append(float(image_scores[i].cpu()))
+            image_score = float(image_scores[i].cpu())
+            label = int(labels[i])
+            image_path = paths[i] if isinstance(paths, (list, tuple)) else paths
+            
+            all_labels.append(label)
+            all_image_scores.append(image_score)
+            
+            # Store image info for detailed output
+            path_obj = Path(image_path)
+            defect_type = path_obj.parent.name
+            image_name = path_obj.stem
+            all_image_info.append({
+                "path": str(image_path),
+                "defect_type": defect_type,
+                "image_name": image_name,
+                "score": image_score,
+                "label": label,
+            })
 
+            # Normalize patch_scores to [0, 1] for heatmap visualization
+            # Use percentile-based normalization for better visualization
+            patch_scores_np = patch_scores[i].detach().cpu().numpy()
+            # Clip extreme values using percentiles
+            p5, p95 = np.percentile(patch_scores_np, [5, 95])
+            patch_scores_clipped = np.clip(patch_scores_np, p5, p95)
+            # Normalize to [0, 1]
+            if p95 - p5 > 1e-8:
+                patch_scores_normalized = (patch_scores_clipped - p5) / (p95 - p5)
+            else:
+                patch_scores_normalized = np.zeros_like(patch_scores_clipped)
+            
             hmap = patches_to_heatmap(
-                patch_logits[i], image_size=image_size, patch_size=patch_size,
+                torch.from_numpy(patch_scores_normalized), 
+                image_size=image_size, 
+                patch_size=patch_size,
+                percentile_clip=(0, 100),  # Already normalized, so no additional clipping
             )
             all_heatmaps.append(hmap)
 
@@ -152,8 +184,8 @@ def evaluate(
                 heatmap_filename = f"{defect_type}_{image_name}_heatmap.png"
                 localization_filename = f"{defect_type}_{image_name}_localization.png"
                 
-                # Save raw heatmap
-                save_heatmap(hmap, os.path.join(save_dir, heatmap_filename))
+                # Save raw heatmap with better colormap
+                save_heatmap(hmap, os.path.join(save_dir, heatmap_filename), colormap="hot")
                 
                 # Save full visualization if requested
                 if save_visualizations:
@@ -185,6 +217,45 @@ def evaluate(
         results["pixel_auroc"] = compute_pixel_auroc(masks_arr, heatmaps_arr)
     else:
         results["pixel_auroc"] = float("nan")
+    
+    # ── Print detailed image scores ──
+    print("\n" + "=" * 80)
+    print("IMAGE-LEVEL ANOMALY SCORES")
+    print("=" * 80)
+    print(f"{'Defect Type':<20} {'Image Name':<30} {'Score':<12} {'Label':<10}")
+    print("-" * 80)
+    
+    # Sort by score (descending) to see most anomalous first
+    sorted_info = sorted(all_image_info, key=lambda x: x["score"], reverse=True)
+    
+    for info in sorted_info:
+        label_str = "Anomaly" if info["label"] == 1 else "Normal"
+        print(f"{info['defect_type']:<20} {info['image_name']:<30} {info['score']:<12.6f} {label_str:<10}")
+    
+    print("-" * 80)
+    print(f"Total images: {len(all_image_info)}")
+    print(f"Normal images: {sum(1 for info in all_image_info if info['label'] == 0)}")
+    print(f"Anomaly images: {sum(1 for info in all_image_info if info['label'] == 1)}")
+    print(f"Score range: [{min(all_image_scores):.6f}, {max(all_image_scores):.6f}]")
+    print("=" * 80 + "\n")
+    
+    # Save scores to CSV file if save_dir is provided
+    if save_dir is not None:
+        import csv
+        csv_path = os.path.join(save_dir, "image_scores.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["defect_type", "image_name", "image_path", "anomaly_score", "label", "is_anomaly"])
+            for info in sorted_info:
+                writer.writerow([
+                    info["defect_type"],
+                    info["image_name"],
+                    info["path"],
+                    f"{info['score']:.6f}",
+                    info["label"],
+                    "Anomaly" if info["label"] == 1 else "Normal",
+                ])
+        print(f"Saved detailed scores to: {csv_path}")
 
     return results
 
@@ -235,9 +306,23 @@ def main() -> None:
     # ── Model ──
     model = SPADE(
         blip2_model_name=cfg["blip2"]["model_name"],
-        patch_head_hidden=cfg["patch_head"]["hidden_dim"],
-        patch_head_dropout=cfg["patch_head"]["dropout"],
         llm_embed_dim=cfg["projection"]["output_dim"],
+        # HPA parameters
+        hpa_n_max=cfg["hpa"]["n_max"],
+        hpa_n_min=cfg["hpa"]["n_min"],
+        hpa_t_steps=cfg["hpa"]["t_steps"],
+        hpa_w=cfg["hpa"]["w"],
+        hpa_p1=cfg["hpa"]["p1"],
+        hpa_p2=cfg["hpa"]["p2"],
+        # Scoring parameters
+        score_alpha=cfg["scoring"]["alpha"],
+        score_beta=cfg["scoring"]["beta"],
+        score_lambda=cfg["scoring"]["lambda"],
+        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
+        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
+        # Normal statistics parameters
+        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
+        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
     ).to(device)
 
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)

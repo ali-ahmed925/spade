@@ -51,9 +51,23 @@ def main() -> None:
     # ── Load model ──
     model = SPADE(
         blip2_model_name=cfg["blip2"]["model_name"],
-        patch_head_hidden=cfg["patch_head"]["hidden_dim"],
-        patch_head_dropout=cfg["patch_head"]["dropout"],
         llm_embed_dim=cfg["projection"]["output_dim"],
+        # HPA parameters
+        hpa_n_max=cfg["hpa"]["n_max"],
+        hpa_n_min=cfg["hpa"]["n_min"],
+        hpa_t_steps=cfg["hpa"]["t_steps"],
+        hpa_w=cfg["hpa"]["w"],
+        hpa_p1=cfg["hpa"]["p1"],
+        hpa_p2=cfg["hpa"]["p2"],
+        # Scoring parameters
+        score_alpha=cfg["scoring"]["alpha"],
+        score_beta=cfg["scoring"]["beta"],
+        score_lambda=cfg["scoring"]["lambda"],
+        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
+        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
+        # Normal statistics parameters
+        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
+        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
     ).to(device)
 
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)
@@ -82,17 +96,18 @@ def main() -> None:
 
     # ── Forward pass ──
     with torch.no_grad():
-        outputs = model(image_tensor)
+        outputs = model(image_tensor)  # No update_stats in inference
 
-    patch_logits = outputs["patch_logits"]    # (1, N)
+    patch_scores = outputs["patch_scores"]    # (1, N)
     visual_tokens = outputs["visual_tokens"]  # (1, Q, D_llm)
 
     # ── Image-level score ──
-    image_score = model.get_image_score(patch_logits).item()
+    image_score = model.get_image_score(patch_scores).item()
     logger.info(f"Image anomaly score: {image_score:.4f}")
 
-    # ── Heatmap ──
-    heatmap = patches_to_heatmap(patch_logits[0], image_size=image_size, patch_size=patch_size)
+    # ── Heatmap (normalize scores first) ──
+    normalized_scores = torch.sigmoid(torch.log1p(patch_scores[0]))
+    heatmap = patches_to_heatmap(normalized_scores, image_size=image_size, patch_size=patch_size)
     overlay = overlay_heatmap(image_resized, heatmap)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -110,7 +125,7 @@ def main() -> None:
         visual_tokens_cpu = visual_tokens.cpu()
         # Move SPADE model to CPU and clear GPU cache
         model = model.cpu()
-        del image_tensor, patch_logits, visual_tokens
+        del image_tensor, patch_scores, visual_tokens
         torch.cuda.empty_cache()
         
         logger.info("Loading frozen LLM for text generation...")
