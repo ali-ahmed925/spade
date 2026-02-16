@@ -1,7 +1,7 @@
 # ── Training ──
 training:
   epochs: 20
-  batch_size: 32
+  batch_size: 8  # Reduced for hierarchical refinement (multiple Q-Former passes)
   learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   warmup_epochs: 5
@@ -10,6 +10,11 @@ training:
   log_interval: 10                        # steps between log prints
   save_interval: 5                        # epochs between checkpoint saves
   checkpoint_dir: "./checkpoints"
+  early_stopping:
+    enabled: true
+    patience: 10                          # epochs to wait before stopping
+    mode: "max"                            # "max" for AUROC, "min" for loss
+    min_delta: 0.001                      # minimum change to qualify as improvement
 
 # ── Weights & Biases ──
 wandb:
