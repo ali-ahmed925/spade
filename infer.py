@@ -105,9 +105,23 @@ def main() -> None:
     image_score = model.get_image_score(patch_scores).item()
     logger.info(f"Image anomaly score: {image_score:.4f}")
 
-    # ── Heatmap (normalize scores first) ──
-    normalized_scores = torch.sigmoid(torch.log1p(patch_scores[0]))
-    heatmap = patches_to_heatmap(normalized_scores, image_size=image_size, patch_size=patch_size)
+    # ── Heatmap (normalize scores for visualization only) ──
+    # NOTE: Normalization is ONLY for visualization. For metric computation (pixel AUROC),
+    # we would use raw scores without per-image normalization.
+    patch_scores_np = patch_scores[0].detach().cpu().numpy()
+    p5, p95 = np.percentile(patch_scores_np, [5, 95])
+    patch_scores_clipped = np.clip(patch_scores_np, p5, p95)
+    if p95 - p5 > 1e-8:
+        patch_scores_normalized = (patch_scores_clipped - p5) / (p95 - p5)
+    else:
+        patch_scores_normalized = np.zeros_like(patch_scores_clipped)
+    
+    heatmap = patches_to_heatmap(
+        torch.from_numpy(patch_scores_normalized),
+        image_size=image_size,
+        patch_size=patch_size,
+        normalize=True,  # Normalize for visualization
+    )
     overlay = overlay_heatmap(image_resized, heatmap)
 
     os.makedirs(args.output_dir, exist_ok=True)

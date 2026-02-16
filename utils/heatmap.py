@@ -13,6 +13,7 @@ def patches_to_heatmap(
     image_size: int = 224,
     patch_size: int = 14,
     percentile_clip: tuple[float, float] = (5.0, 95.0),
+    normalize: bool = True,
 ) -> np.ndarray:
     """Reshape flat patch scores into a 2-D heatmap and upsample.
 
@@ -21,27 +22,33 @@ def patches_to_heatmap(
         image_size: original image spatial size.
         patch_size: ViT patch size.
         percentile_clip: (low, high) percentiles for robust normalization.
+        normalize: If True, normalize to [0, 1] using percentiles. If False, return raw scores.
+                  Set to False for metric computation (pixel AUROC), True for visualization.
 
     Returns:
-        (image_size, image_size) numpy heatmap in [0, 1].
+        (image_size, image_size) numpy heatmap.
+        - If normalize=True: values in [0, 1]
+        - If normalize=False: raw anomaly scores (may be negative or > 1)
     """
     grid = int(math.sqrt(patch_scores.numel()))
     hmap = patch_scores.detach().cpu().float().reshape(grid, grid).numpy()
     # Bilinear upsample to image resolution
     hmap = cv2.resize(hmap, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
     
-    # Robust normalization using percentiles to handle outliers
-    hmin = np.percentile(hmap, percentile_clip[0])
-    hmax = np.percentile(hmap, percentile_clip[1])
-    
-    # Clip extreme values
-    hmap = np.clip(hmap, hmin, hmax)
-    
-    # Normalize to [0, 1]
-    if hmax - hmin > 1e-8:
-        hmap = (hmap - hmin) / (hmax - hmin)
-    else:
-        hmap = np.zeros_like(hmap)
+    if normalize:
+        # Robust normalization using percentiles to handle outliers
+        # ONLY for visualization - NOT for metric computation
+        hmin = np.percentile(hmap, percentile_clip[0])
+        hmax = np.percentile(hmap, percentile_clip[1])
+        
+        # Clip extreme values
+        hmap = np.clip(hmap, hmin, hmax)
+        
+        # Normalize to [0, 1]
+        if hmax - hmin > 1e-8:
+            hmap = (hmap - hmin) / (hmax - hmin)
+        else:
+            hmap = np.zeros_like(hmap)
     
     return hmap
 

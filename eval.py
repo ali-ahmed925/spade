@@ -142,25 +142,38 @@ def evaluate(
                 "label": label,
             })
 
-            # Normalize patch_scores to [0, 1] for heatmap visualization
-            # Use percentile-based normalization for better visualization
-            patch_scores_np = patch_scores[i].detach().cpu().numpy()
-            # Clip extreme values using percentiles
-            p5, p95 = np.percentile(patch_scores_np, [5, 95])
-            patch_scores_clipped = np.clip(patch_scores_np, p5, p95)
-            # Normalize to [0, 1]
-            if p95 - p5 > 1e-8:
-                patch_scores_normalized = (patch_scores_clipped - p5) / (p95 - p5)
-            else:
-                patch_scores_normalized = np.zeros_like(patch_scores_clipped)
-            
-            hmap = patches_to_heatmap(
-                torch.from_numpy(patch_scores_normalized), 
-                image_size=image_size, 
+            # CRITICAL: Use RAW scores for pixel AUROC computation (no per-image normalization)
+            # Per-image normalization artificially inflates pixel AUROC by stretching each
+            # image's score distribution independently, removing global calibration.
+            patch_scores_raw = patch_scores[i].detach().cpu()
+            hmap_raw = patches_to_heatmap(
+                patch_scores_raw,
+                image_size=image_size,
                 patch_size=patch_size,
-                percentile_clip=(0, 100),  # Already normalized, so no additional clipping
+                normalize=False,  # NO normalization for metric computation
             )
-            all_heatmaps.append(hmap)
+            all_heatmaps.append(hmap_raw)
+            
+            # For visualization: create normalized version (only if saving)
+            if save_dir is not None:
+                # Normalize patch_scores to [0, 1] for visualization only
+                patch_scores_np = patch_scores_raw.numpy()
+                p5, p95 = np.percentile(patch_scores_np, [5, 95])
+                patch_scores_clipped = np.clip(patch_scores_np, p5, p95)
+                if p95 - p5 > 1e-8:
+                    patch_scores_normalized = (patch_scores_clipped - p5) / (p95 - p5)
+                else:
+                    patch_scores_normalized = np.zeros_like(patch_scores_clipped)
+                
+                hmap_viz = patches_to_heatmap(
+                    torch.from_numpy(patch_scores_normalized),
+                    image_size=image_size,
+                    patch_size=patch_size,
+                    normalize=True,  # Normalize for visualization
+                    percentile_clip=(0, 100),  # Already normalized
+                )
+            else:
+                hmap_viz = None
 
             if isinstance(masks[i], torch.Tensor):
                 gt_mask = masks[i].numpy()
@@ -184,26 +197,27 @@ def evaluate(
                 heatmap_filename = f"{defect_type}_{image_name}_heatmap.png"
                 localization_filename = f"{defect_type}_{image_name}_localization.png"
                 
-                # Save raw heatmap with better colormap
-                save_heatmap(hmap, os.path.join(save_dir, heatmap_filename), colormap="hot")
-                
-                # Save full visualization if requested
-                if save_visualizations:
-                    # Load original image (not transformed)
-                    image_np = cv2.imread(image_path)
-                    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-                    image_np = cv2.resize(image_np, (image_size, image_size))
+                # Save normalized heatmap for visualization (hmap_viz was created above)
+                if hmap_viz is not None:
+                    save_heatmap(hmap_viz, os.path.join(save_dir, heatmap_filename), colormap="hot")
                     
-                    viz_path = os.path.join(save_dir, localization_filename)
-                    save_localization_visualization(
-                        image_path=image_path,
-                        image_np=image_np,
-                        gt_mask=gt_mask,
-                        heatmap=hmap,
-                        image_score=float(image_scores[i].cpu()),
-                        label=int(labels[i]),
-                        output_path=viz_path,
-                    )
+                    # Save full visualization if requested
+                    if save_visualizations:
+                        # Load original image (not transformed)
+                        image_np = cv2.imread(image_path)
+                        image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+                        image_np = cv2.resize(image_np, (image_size, image_size))
+                        
+                        viz_path = os.path.join(save_dir, localization_filename)
+                        save_localization_visualization(
+                            image_path=image_path,
+                            image_np=image_np,
+                            gt_mask=gt_mask,
+                            heatmap=hmap_viz,  # Use normalized version for visualization
+                            image_score=float(image_scores[i].cpu()),
+                            label=int(labels[i]),
+                            output_path=viz_path,
+                        )
 
     labels_arr = np.array(all_labels)
     scores_arr = np.array(all_image_scores)
