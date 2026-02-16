@@ -25,14 +25,14 @@ class TotalLoss(nn.Module):
 
     def forward(
         self,
-        patch_logits: torch.Tensor,
+        patch_scores: torch.Tensor,  # Changed from patch_logits
         patch_targets: torch.Tensor,
         query_embeds: torch.Tensor,
         labels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
-            patch_logits:  (B, N) raw patch logits.
+            patch_scores:  (B, N) patch anomaly scores (Mahalanobis-based).
             patch_targets: (B, N) binary patch labels.
             query_embeds:  (B, Q, D) Q-Former outputs (unused, kept for API compatibility).
             labels:        (B,) image-level binary labels (unused, kept for API compatibility).
@@ -40,7 +40,7 @@ class TotalLoss(nn.Module):
         Returns:
             dict with keys: total, patch — all scalar tensors.
         """
-        l_patch = self.patch_loss_fn(patch_logits, patch_targets)
+        l_patch = self.patch_loss_fn(patch_scores, patch_targets)
 
         total = self.patch_weight * l_patch
 
@@ -48,6 +48,3 @@ class TotalLoss(nn.Module):
             "total": total,
             "patch": l_patch,
         }
-
-
-
