@@ -30,6 +30,11 @@ debug_output/
 #results
 my_results/
 test_output/
+eval_output/
+inference_output/
 
 #wandb
 wandb/
+
+#pngs
+*.png
