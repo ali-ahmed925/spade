@@ -2,14 +2,15 @@
 dataset:
   name: "mvtec"
   root: "./datasets/mvtec_anomaly_detection"
-  category: "toothbrush"                      # single category or "all"
+  category: "screw"                      # single category or "all"
   image_size: 224
   num_workers: 4
 
 # ── Synthetic Anomaly Generation ──
+# DISABLED: Training on normal samples only (unsupervised anomaly detection)
 synthetic:
-  enabled: true
-  synthetic_prob: 0.2                     # train split: probability of applying synthetic anomaly
+  enabled: false                          # Set to false for unsupervised training on normal samples only
+  synthetic_prob: 0.0                     # No synthetic anomalies during training
   # Methods are automatically selected based on category (see synthetic.py CATEGORY_METHODS)
   # Available methods: "cutpaste", "crack"
   cutpaste:
@@ -26,14 +27,16 @@ synthetic:
     darkness: 0.3                          # how dark the crack appears (0.0-1.0)
     branching_prob: 0.3                    # probability of creating a branch
 
-# ── Validation from normal-only train split (no real test leakage) ──
+# ── Validation ──
 validation:
   enabled: true
-  source: "train_good"
-  size: 40                                # number of images held out from train/good
+  use_real_test: true                     # Use real test anomalies for validation (split test 50/50)
+                                          # If false, uses synthetic anomalies from train_good (not recommended)
+  source: "train_good"                    # Ignored if use_real_test=true
+  size: 40                                # Ignored if use_real_test=true
   seed: 42
-  synthetic_prob: 0.2                     # mix of clean + synthetic anomalies in val
-  synthetic_method: "cutpaste"            # or "crack" (auto-selected based on category if not specified)
+  synthetic_prob: 0.2                     # Ignored if use_real_test=true
+  synthetic_method: "cutpaste"            # Ignored if use_real_test=true
 
 
 

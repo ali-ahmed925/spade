@@ -30,10 +30,19 @@ wandb:
 
 # ── Loss Weights ──
 loss:
+  # Common parameters
   patch_weight: 1.0
+  
+  # Synthetic training parameters (when synthetic.enabled=true)
   use_focal: false
   focal_alpha: 0.25
   focal_gamma: 2.0
+  
+  # Normal-only training parameters (when synthetic.enabled=false)
+  var_weight: 0.1              # Weight for variance term in Mahalanobis loss (encourages tight clustering)
+  use_pseudo: true           # Use pseudo-anomaly loss for contrastive learning
+  pseudo_epsilon: 0.01       # Perturbation magnitude for pseudo-anomaly loss
+  clamp_max: 100.0            # Maximum score for soft clipping
 
 
 

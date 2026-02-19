@@ -28,8 +28,18 @@ class PatchBCELoss(nn.Module):
         Returns:
             Scalar loss.
         """
-        # Normalize scores to [0, 1] using sigmoid of log1p for numerical stability
-        normalized_scores = torch.sigmoid(torch.log1p(scores))
+        # For normal-only training (all targets=0), we want to push scores → 0
+        # Use a more stable loss that encourages score reduction
+        # Instead of clamping, use soft clipping with tanh or a smoother normalization
+        
+        # Soft clipping: scores -> scores / (1 + scores/scale) to prevent extreme values
+        # This allows gradients to flow even for high scores
+        scale = 10.0  # Scale factor for soft clipping
+        scores_soft_clipped = scores / (1.0 + scores / scale)  # Soft clip to ~scale
+        
+        # Normalize to [0, 1] using sigmoid of scaled scores
+        # Use a smaller scale for sigmoid to make it more sensitive to changes
+        normalized_scores = torch.sigmoid(scores_soft_clipped / 2.0)  # Divide by 2 to make sigmoid more sensitive
         
         return F.binary_cross_entropy(normalized_scores, targets)
 
@@ -58,8 +68,12 @@ class FocalLoss(nn.Module):
         Returns:
             Scalar focal loss.
         """
+        # Soft clipping instead of hard clamping for better gradient flow
+        scale = 10.0
+        scores_soft_clipped = scores / (1.0 + scores / scale)
+        
         # Normalize scores to probabilities
-        probs = torch.sigmoid(torch.log1p(scores))  # (B, N)
+        probs = torch.sigmoid(scores_soft_clipped / 2.0)  # (B, N)
         
         # Compute p_t
         p_t = probs * targets + (1 - probs) * (1 - targets)

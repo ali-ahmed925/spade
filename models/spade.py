@@ -211,10 +211,15 @@ class SPADE(nn.Module):
         final_deviation = self.mahalanobis_scorer(patch_embeds)  # (B, N)
         
         # Final patch scores with cross-term
+        # Normalize attention importance to [0, 1] range to prevent extreme values
+        # Attention importance can be very high initially (sum over queries, each in [0,1])
+        # With 32 queries, max attention_importance = 32, which is too high
+        attn_importance_norm = final_attn_importance / (self.qformer.num_queries + 1e-8)  # Normalize by num queries
+        
         patch_scores = (
-            self.score_alpha * final_attn_importance +
+            self.score_alpha * attn_importance_norm +
             self.score_beta * final_deviation +
-            self.score_lambda * (final_attn_importance * final_deviation)
+            self.score_lambda * (attn_importance_norm * final_deviation)
         )  # (B, N)
         
         # 6. Project for LLM (use initial query embeds for consistency)

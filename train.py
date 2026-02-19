@@ -55,6 +55,9 @@ def train_one_epoch(
     model.vision_encoder.eval()
 
     running = {"total": 0.0, "patch": 0.0}
+    # Add pseudo key if using normal-only training with pseudo-anomaly loss
+    if not cfg["synthetic"].get("enabled", False) and cfg.get("loss", {}).get("use_pseudo", False):
+        running["pseudo"] = 0.0
     num_batches = 0
     global_step = (epoch - 1) * len(loader)
 
@@ -75,13 +78,25 @@ def train_one_epoch(
             update_stats=True,  # Update normal statistics during training
         )
 
-        # Loss - now uses patch_scores instead of patch_logits
+        # Loss: With normal-only training, all patch_labels = 0 (normal patches)
+        # Loss pushes patch_scores → 0 for normal patches
+        # Q-Former learns to represent normal features
+        # Mahalanobis learns normal distribution
+        # At test time, anomalies have high Mahalanobis distance → high scores → detected
         losses = criterion(
-            patch_scores=outputs["patch_scores"],  # Changed from patch_logits
-            patch_targets=patch_labels,
+            patch_scores=outputs["patch_scores"],
+            patch_targets=patch_labels,  # All zeros for normal-only training
             query_embeds=outputs["query_embeds"],
-            labels=labels,
+            labels=labels,  # All zeros for normal-only training
         )
+        
+        # Debug: Log score statistics to see if they're changing
+        if step == 0 and epoch == 1:
+            with torch.no_grad():
+                score_mean = outputs["patch_scores"].mean().item()
+                score_max = outputs["patch_scores"].max().item()
+                score_min = outputs["patch_scores"].min().item()
+                logger.info(f"Epoch {epoch} Step {step}: scores mean={score_mean:.4f}, min={score_min:.4f}, max={score_max:.4f}")
 
         # Backward
         optimizer.zero_grad()
@@ -90,9 +105,10 @@ def train_one_epoch(
         optimizer.step()
         scheduler.step()
 
-        # Accumulate
+        # Accumulate (handle optional keys like "pseudo")
         for k in running:
-            running[k] += losses[k].item()
+            if k in losses:
+                running[k] += losses[k].item()
         num_batches += 1
         
         # Clear intermediate tensors
@@ -110,14 +126,18 @@ def train_one_epoch(
 
             # Log to wandb at step level
             if use_wandb:
-                wandb.log({
+                log_dict = {
                     "train/loss_total": running["total"] / num_batches,
                     "train/loss_patch": running["patch"] / num_batches,
                     "train/learning_rate": scheduler.get_last_lr()[0],
                     "train/gradient_norm": grad_norm,
                     "train/epoch": epoch,
                     "train/step": current_step,
-                }, step=current_step)
+                }
+                # Add pseudo loss if available
+                if "pseudo" in running:
+                    log_dict["train/loss_pseudo"] = running["pseudo"] / num_batches
+                wandb.log(log_dict, step=current_step)
 
     return {k: v / max(num_batches, 1) for k, v in running.items()}
 
@@ -202,56 +222,96 @@ def main() -> None:
         logger.info("Initialized Weights & Biases logging")
 
     # ── Train/Val split from train/good (normal-only) ──
-    # synthetic_method=None means auto-select based on category
+    # Unsupervised training: only normal samples, no synthetic anomalies
+    use_synthetic = cfg["synthetic"].get("enabled", False)
+    if use_synthetic:
+        synthetic_method = None  # None = auto-select based on category
+        synthetic_prob = cfg["synthetic"].get("synthetic_prob", 0.2)
+    else:
+        synthetic_method = None  # None = no synthetic anomalies
+        synthetic_prob = 0.0  # No synthetic anomalies
+    
     base_train = MVTecDataset(
         root=cfg["dataset"]["root"],
         category=cfg["dataset"]["category"],
         split="train",
         image_size=cfg["vit"]["image_size"],
         patch_size=cfg["vit"]["patch_size"],
-        synthetic_method=None,  # Auto-select based on category
-        synthetic_prob=cfg["synthetic"].get("synthetic_prob", 0.2),
+        synthetic_method=synthetic_method,  # None = no synthetic anomalies
+        synthetic_prob=synthetic_prob,  # 0.0 = no synthetic anomalies
         synthetic_cfg=cfg.get("synthetic", {}),
     )
 
     val_cfg = cfg.get("validation", {})
-    use_synth_val = bool(val_cfg.get("enabled", True)) and val_cfg.get("source", "train_good") == "train_good"
-    if use_synth_val:
-        n = len(base_train)
-        val_size = int(val_cfg.get("size", 40))
-        val_size = max(1, min(val_size, n - 1))
-        rng = np.random.RandomState(int(val_cfg.get("seed", 42)))
-        perm = rng.permutation(n).tolist()
-        val_indices = perm[:val_size]
-        train_indices = perm[val_size:]
-        logger.info(f"Train/Val split from train/good → train={len(train_indices)} val={len(val_indices)}")
+    use_real_val = val_cfg.get("use_real_test", True)  # Use real test anomalies for validation
+    
+    if val_cfg.get("enabled", True):
+        if use_real_val:
+            # Use real test set anomalies for validation (split test 50/50)
+            test_dataset = MVTecDataset(
+                root=cfg["dataset"]["root"],
+                category=cfg["dataset"]["category"],
+                split="test",
+                image_size=cfg["vit"]["image_size"],
+                patch_size=cfg["vit"]["patch_size"],
+                synthetic_method=None,  # No synthetic for test set
+                synthetic_prob=0.0,
+            )
+            # Split test set 50/50 for val/test
+            n_test = len(test_dataset)
+            val_size = n_test // 2
+            rng = np.random.RandomState(int(val_cfg.get("seed", 42)))
+            perm = rng.permutation(n_test).tolist()
+            val_indices_test = perm[:val_size]
+            val_dataset = MVTecDataset(
+                root=cfg["dataset"]["root"],
+                category=cfg["dataset"]["category"],
+                split="test",
+                image_size=cfg["vit"]["image_size"],
+                patch_size=cfg["vit"]["patch_size"],
+                synthetic_method=None,
+                synthetic_prob=0.0,
+                subset_indices=val_indices_test,
+            )
+            logger.info(f"Using real test anomalies for validation: {len(val_dataset)} samples (from {n_test} test samples)")
+            train_dataset = base_train  # Use all training data
+        else:
+            # Fallback: synthetic validation from train/good (not recommended for unsupervised)
+            n = len(base_train)
+            val_size = int(val_cfg.get("size", 40))
+            val_size = max(1, min(val_size, n - 1))
+            rng = np.random.RandomState(int(val_cfg.get("seed", 42)))
+            perm = rng.permutation(n).tolist()
+            val_indices = perm[:val_size]
+            train_indices = perm[val_size:]
+            logger.info(f"Train/Val split from train/good → train={len(train_indices)} val={len(val_indices)}")
 
-        train_dataset = MVTecDataset(
-            root=cfg["dataset"]["root"],
-            category=cfg["dataset"]["category"],
-            split="train",
-            image_size=cfg["vit"]["image_size"],
-            patch_size=cfg["vit"]["patch_size"],
-            synthetic_method=None,  # Auto-select based on category
-            synthetic_prob=cfg["synthetic"].get("synthetic_prob", 0.2),
-            subset_indices=train_indices,
-            deterministic=False,
-            synthetic_cfg=cfg.get("synthetic", {}),
-        )
+            train_dataset = MVTecDataset(
+                root=cfg["dataset"]["root"],
+                category=cfg["dataset"]["category"],
+                split="train",
+                image_size=cfg["vit"]["image_size"],
+                patch_size=cfg["vit"]["patch_size"],
+                synthetic_method=synthetic_method,  # None = no synthetic anomalies
+                synthetic_prob=synthetic_prob,  # 0.0 = no synthetic anomalies
+                subset_indices=train_indices,
+                deterministic=False,
+                synthetic_cfg=cfg.get("synthetic", {}),
+            )
 
-        val_dataset = MVTecDataset(
-            root=cfg["dataset"]["root"],
-            category=cfg["dataset"]["category"],
-            split="train",
-            image_size=cfg["vit"]["image_size"],
-            patch_size=cfg["vit"]["patch_size"],
-            synthetic_method=val_cfg.get("synthetic_method", None),  # None = auto-select
-            synthetic_prob=float(val_cfg.get("synthetic_prob", 0.2)),
-            subset_indices=val_indices,
-            deterministic=True,
-            synthetic_cfg=cfg.get("synthetic", {}),
-            base_seed=int(val_cfg.get("seed", 42)),
-        )
+            val_dataset = MVTecDataset(
+                root=cfg["dataset"]["root"],
+                category=cfg["dataset"]["category"],
+                split="train",
+                image_size=cfg["vit"]["image_size"],
+                patch_size=cfg["vit"]["patch_size"],
+                synthetic_method=val_cfg.get("synthetic_method", None),
+                synthetic_prob=float(val_cfg.get("synthetic_prob", 0.2)),
+                subset_indices=val_indices,
+                deterministic=True,
+                synthetic_cfg=cfg.get("synthetic", {}),
+                base_seed=int(val_cfg.get("seed", 42)),
+            )
     else:
         train_dataset = base_train
         val_dataset = None
@@ -274,7 +334,7 @@ def main() -> None:
             num_workers=cfg["dataset"]["num_workers"],
             pin_memory=True,
         )
-        logger.info(f"Validation samples (synthetic from train/good): {len(val_dataset)}")
+        logger.info(f"Validation samples: {len(val_dataset)}")
     else:
         val_loader = None
 
@@ -326,12 +386,35 @@ def main() -> None:
         total_epochs=tcfg["epochs"],
         steps_per_epoch=len(loader),
     )
-    criterion = TotalLoss(
-        patch_weight=cfg["loss"]["patch_weight"],
-        use_focal=cfg["loss"]["use_focal"],
-        focal_alpha=cfg["loss"]["focal_alpha"],
-        focal_gamma=cfg["loss"]["focal_gamma"],
-    )
+    
+    # Select loss based on training mode
+    use_synthetic = cfg["synthetic"].get("enabled", False)
+    if use_synthetic:
+        # Synthetic training: BCE/Focal loss
+        criterion = TotalLoss(
+            patch_weight=cfg["loss"]["patch_weight"],
+            use_focal=cfg["loss"]["use_focal"],
+            focal_alpha=cfg["loss"]["focal_alpha"],
+            focal_gamma=cfg["loss"]["focal_gamma"],
+            use_normal_only=False,
+        )
+        logger.info("Using BCE/Focal loss for synthetic training")
+    else:
+        # Normal-only training: Mahalanobis clustering loss
+        loss_cfg = cfg.get("loss", {})
+        criterion = TotalLoss(
+            patch_weight=loss_cfg.get("patch_weight", 1.0),
+            use_normal_only=True,
+            var_weight=loss_cfg.get("var_weight", 0.1),
+            use_pseudo=loss_cfg.get("use_pseudo", False),
+            pseudo_epsilon=loss_cfg.get("pseudo_epsilon", 0.01),
+            clamp_max=loss_cfg.get("clamp_max", 100.0),
+        )
+        logger.info(
+            f"Using Mahalanobis clustering loss for normal-only training "
+            f"(var_weight={loss_cfg.get('var_weight', 0.1)}, "
+            f"use_pseudo={loss_cfg.get('use_pseudo', False)})"
+        )
 
     # ── Training loop ──
     # Organize checkpoints by category
@@ -365,7 +448,7 @@ def main() -> None:
             f"patch: {metrics['patch']:.4f}"
         )
 
-        # ── Validation (synthetic from train/good to avoid test leakage) ──
+        # ── Validation (real test anomalies or synthetic) ──
         if val_loader is not None:
             val_metrics = validate(model, val_loader, device)
             logger.info(
@@ -377,13 +460,17 @@ def main() -> None:
 
         # Log epoch-level metrics to wandb
         if use_wandb:
-            wandb.log({
+            log_dict = {
                 "epoch/loss_total": metrics["total"],
                 "epoch/loss_patch": metrics["patch"],
                 "epoch/epoch": epoch,
                 "val/image_auroc": val_metrics["val/image_auroc"],
                 "val/patch_auroc": val_metrics["val/patch_auroc"],
-            }, step=epoch * len(loader))
+            }
+            # Add pseudo loss if available
+            if "pseudo" in metrics:
+                log_dict["epoch/loss_pseudo"] = metrics["pseudo"]
+            wandb.log(log_dict, step=epoch * len(loader))
 
         # ── Early Stopping Check ──
         # Use combined metric (average of image and patch AUROC) for early stopping
