@@ -334,8 +334,13 @@ def main() -> None:
     )
 
     # ── Training loop ──
-    os.makedirs(tcfg["checkpoint_dir"], exist_ok=True)
+    # Organize checkpoints by category
+    category = cfg["dataset"]["category"]
+    checkpoint_dir = os.path.join(tcfg["checkpoint_dir"], category)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
     best_val_image_auroc = -float("inf")
+    best_val_patch_auroc = -float("inf")
     best_epoch = -1
     
     # ── Early Stopping ──
@@ -381,44 +386,120 @@ def main() -> None:
             }, step=epoch * len(loader))
 
         # ── Early Stopping Check ──
+        # Use combined metric (average of image and patch AUROC) for early stopping
         if early_stopper is not None and val_loader is not None:
-            current_score = val_metrics["val/image_auroc"]
+            current_image = val_metrics["val/image_auroc"]
+            current_patch = val_metrics["val/patch_auroc"]
+            # Use average of both metrics, or image AUROC if patch is NaN
+            if not np.isnan(current_image) and not np.isnan(current_patch):
+                current_score = (current_image + current_patch) / 2.0
+            elif not np.isnan(current_image):
+                current_score = current_image
+            else:
+                current_score = float("nan")
+            
             if not np.isnan(current_score):
                 if early_stopper(current_score):
-                    logger.info(f"Early stopping triggered at epoch {epoch}")
+                    logger.info(
+                        f"Early stopping triggered at epoch {epoch} "
+                        f"(combined score: {current_score:.4f} = "
+                        f"image:{current_image:.4f} + patch:{current_patch:.4f} / 2)"
+                    )
                     if use_wandb:
                         wandb.log({"early_stopping/triggered": True, "early_stopping/epoch": epoch})
                     break
 
-        # Save checkpoint ONLY when validation improves (max score wins)
-        current = val_metrics["val/image_auroc"]
-        if val_loader is not None and (not np.isnan(current)) and current > best_val_image_auroc:
-            best_val_image_auroc = current
-            best_epoch = epoch
+        # ── Checkpoint Saving Logic ──
+        # Save checkpoint when:
+        # 1. BOTH metrics improve, OR
+        # 2. One improves and the other stays constant, OR
+        # 3. One improves and the other degrades only slightly (within tolerance)
+        current_image = val_metrics["val/image_auroc"]
+        current_patch = val_metrics["val/patch_auroc"]
+        
+        # Get degradation tolerance from config (default 0.02 = 2% acceptable drop)
+        degradation_tolerance = tcfg.get("checkpoint", {}).get("degradation_tolerance", 0.02)
+        
+        if val_loader is not None:
+            image_valid = not np.isnan(current_image)
+            patch_valid = not np.isnan(current_patch)
+            
+            if image_valid and patch_valid:
+                image_improved = current_image > best_val_image_auroc
+                patch_improved = current_patch > best_val_patch_auroc
+                image_degraded = current_image < best_val_image_auroc
+                patch_degraded = current_patch < best_val_patch_auroc
+                image_unchanged = current_image == best_val_image_auroc
+                patch_unchanged = current_patch == best_val_patch_auroc
+                
+                # Check if degradation is within acceptable tolerance
+                image_degradation = best_val_image_auroc - current_image if image_degraded else 0.0
+                patch_degradation = best_val_patch_auroc - current_patch if patch_degraded else 0.0
+                image_degradation_acceptable = image_degradation <= degradation_tolerance
+                patch_degradation_acceptable = patch_degradation <= degradation_tolerance
+                
+                # Save checkpoint if:
+                # 1. BOTH metrics improve, OR
+                # 2. One improves and the other stays constant, OR
+                # 3. One improves and the other degrades only slightly (within tolerance)
+                should_save = (
+                    (image_improved and patch_improved) or
+                    (image_improved and patch_unchanged) or
+                    (patch_improved and image_unchanged) or
+                    (image_improved and patch_degradation_acceptable) or
+                    (patch_improved and image_degradation_acceptable)
+                )
+                
+                if should_save:
+                    best_val_image_auroc = current_image
+                    best_val_patch_auroc = current_patch
+                    best_epoch = epoch
 
-            trainable_state = {
-                k: v for k, v in model.state_dict().items()
-                if any(k.startswith(prefix) for prefix in ["qformer.", "projection.", "hpa.", "query_patch_attn.", "mahalanobis_scorer.", "normal_stats_tracker."])
-            }
+                    trainable_state = {
+                        k: v for k, v in model.state_dict().items()
+                        if any(k.startswith(prefix) for prefix in ["qformer.", "projection.", "hpa.", "query_patch_attn.", "mahalanobis_scorer.", "normal_stats_tracker."])
+                    }
 
-            best_path = os.path.join(tcfg["checkpoint_dir"], "spade_best.pt")
-            torch.save({
-                "epoch": epoch,
-                "val_image_auroc": float(best_val_image_auroc),
-                "model_state_dict": trainable_state,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "config": {
-                    "blip2_model_name": cfg["blip2"]["model_name"],
-                    "llm_embed_dim": cfg["projection"]["output_dim"],
-                    "hpa": cfg["hpa"],
-                    "scoring": cfg["scoring"],
-                    "normal_stats": cfg["normal_stats"],
-                },
-            }, best_path)
-            logger.info(f"New best val/image_auroc={best_val_image_auroc:.4f} @ epoch {epoch} → saved {best_path}")
-            if use_wandb:
-                wandb.run.summary["best_val_image_auroc"] = float(best_val_image_auroc)
-                wandb.run.summary["best_epoch"] = int(best_epoch)
+                    best_path = os.path.join(checkpoint_dir, "spade_best.pt")
+                    torch.save({
+                        "epoch": epoch,
+                        "val_image_auroc": float(best_val_image_auroc),
+                        "val_patch_auroc": float(best_val_patch_auroc),
+                        "model_state_dict": trainable_state,
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "config": {
+                            "blip2_model_name": cfg["blip2"]["model_name"],
+                            "llm_embed_dim": cfg["projection"]["output_dim"],
+                            "hpa": cfg["hpa"],
+                            "scoring": cfg["scoring"],
+                            "normal_stats": cfg["normal_stats"],
+                        },
+                    }, best_path)
+                    logger.info(
+                        f"New best metrics @ epoch {epoch} → "
+                        f"image_auroc={best_val_image_auroc:.4f}, "
+                        f"patch_auroc={best_val_patch_auroc:.4f} → saved {best_path}"
+                    )
+                    if use_wandb:
+                        wandb.run.summary["best_val_image_auroc"] = float(best_val_image_auroc)
+                        wandb.run.summary["best_val_patch_auroc"] = float(best_val_patch_auroc)
+                        wandb.run.summary["best_epoch"] = int(best_epoch)
+                elif image_improved or patch_improved:
+                    # Log when only one metric improves but the other degrades beyond tolerance
+                    if image_improved and patch_degraded and not patch_degradation_acceptable:
+                        logger.info(
+                            f"Image AUROC improved ({current_image:.4f} > {best_val_image_auroc:.4f}), "
+                            f"but patch AUROC degraded too much ({current_patch:.4f} < {best_val_patch_auroc:.4f}, "
+                            f"degradation: {patch_degradation:.4f} > tolerance: {degradation_tolerance:.4f}) - "
+                            f"checkpoint not saved"
+                        )
+                    elif patch_improved and image_degraded and not image_degradation_acceptable:
+                        logger.info(
+                            f"Patch AUROC improved ({current_patch:.4f} > {best_val_patch_auroc:.4f}), "
+                            f"but image AUROC degraded too much ({current_image:.4f} < {best_val_image_auroc:.4f}, "
+                            f"degradation: {image_degradation:.4f} > tolerance: {degradation_tolerance:.4f}) - "
+                            f"checkpoint not saved"
+                        )
 
     if use_wandb:
         wandb.finish()

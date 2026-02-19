@@ -287,6 +287,17 @@ def main() -> None:
     logger = get_logger("eval")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # ── Organize outputs by category ──
+    category = cfg["dataset"]["category"]
+    if args.save_heatmaps is not None:
+        # Create category-specific directory: eval_output/{category}/heatmaps/
+        base_dir = args.save_heatmaps
+        save_dir = os.path.join(base_dir, category, "heatmaps")
+        os.makedirs(save_dir, exist_ok=True)
+        logger.info(f"Heatmaps will be saved to: {save_dir}")
+    else:
+        save_dir = None
+
     # ── Initialize wandb (optional) ──
     if args.log_wandb:
         if args.wandb_run_id:
@@ -359,7 +370,7 @@ def main() -> None:
         model, loader, device,
         image_size=cfg["vit"]["image_size"],
         patch_size=cfg["vit"]["patch_size"],
-        save_dir=args.save_heatmaps,
+        save_dir=save_dir,
         save_visualizations=args.save_visualizations,
     )
     logger.info(f"Image AUROC: {results['image_auroc']:.4f}")

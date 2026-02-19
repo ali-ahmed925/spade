@@ -2,7 +2,7 @@
 dataset:
   name: "mvtec"
   root: "./datasets/mvtec_anomaly_detection"
-  category: "bottle"                      # single category or "all"
+  category: "toothbrush"                      # single category or "all"
   image_size: 224
   num_workers: 4
 

@@ -15,6 +15,9 @@ training:
     patience: 10                          # epochs to wait before stopping
     mode: "max"                            # "max" for AUROC, "min" for loss
     min_delta: 0.001                      # minimum change to qualify as improvement
+  checkpoint:
+    degradation_tolerance: 0.02           # Acceptable degradation (e.g., 0.02 = 2% drop is OK)
+                                          # If one metric improves and other degrades <= this, still save
 
 # ── Weights & Biases ──
 wandb:
