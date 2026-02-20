@@ -59,8 +59,11 @@ class HybridPatchAnnealing(nn.Module):
         cls_token: torch.Tensor,
         alpha: float = 0.5,
         beta: float = 0.5,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform hierarchical patch refinement with attention re-computation.
+        
+        Queries are accumulated across refinement steps: each iteration uses the
+        refined queries from the previous step, allowing hierarchical refinement.
         
         Args:
             patch_embeds: (B, N, D) patch embeddings (without CLS).
@@ -73,13 +76,17 @@ class HybridPatchAnnealing(nn.Module):
             beta: Weight for deviation.
             
         Returns:
-            (refined_patches, selected_indices)
+            (refined_patches, selected_indices, final_refined_queries)
             - refined_patches: (B, N_min, D) final refined patches.
             - selected_indices: (B, N_min) indices of selected patches.
+            - final_refined_queries: (B, Q, D_q) final refined queries after all steps.
         """
         B, N, D = patch_embeds.shape
         current_patches = patch_embeds.clone()
         current_indices = torch.arange(N, device=patch_embeds.device).unsqueeze(0).expand(B, -1)
+        
+        # ── CRITICAL: Initialize query tokens and accumulate refinement ──
+        current_query_tokens = query_tokens.clone()  # Start with original learnable tokens
         
         # Hierarchical refinement steps
         for t in range(self.t_steps):
@@ -88,7 +95,7 @@ class HybridPatchAnnealing(nn.Module):
             if current_patches.shape[1] <= n_t:
                 break
             
-            # ── CRITICAL: Re-compute attention on current patch subset ──
+            # ── Re-compute attention on current patch subset ──
             # 1. Re-compute Q-Former queries on current patches
             current_image_embeds = torch.cat([cls_token, current_patches], dim=1)  # (B, N_t+1, D)
             image_atts = torch.ones(
@@ -97,13 +104,16 @@ class HybridPatchAnnealing(nn.Module):
                 device=current_image_embeds.device,
             )
             
-            # Re-run Q-Former on refined patch set
+            # Re-run Q-Former with accumulated refined queries
             qformer_outputs = qformer(
-                query_embeds=query_tokens,
+                query_embeds=current_query_tokens,  # ✅ Use accumulated refined queries
                 encoder_hidden_states=current_image_embeds,
                 encoder_attention_mask=image_atts,
             )
             refined_query_embeds = qformer_outputs.last_hidden_state  # (B, Q, D_q)
+            
+            # ── CRITICAL: Update query tokens for next iteration ──
+            current_query_tokens = refined_query_embeds  # ✅ Accumulate refinement
             
             # 2. Re-compute attention importance on current patches
             _, attention_importance = query_patch_attn(
@@ -124,16 +134,31 @@ class HybridPatchAnnealing(nn.Module):
             current_patches = current_patches[batch_indices, top_indices_local]
             current_indices = current_indices[batch_indices, top_indices_local]
             
-            # Update CLS token (optional, could keep original)
-            # For now, we'll recompute it from current patches
+            # Update CLS token
             cls_token = current_patches.mean(dim=1, keepdim=True)
             
-            # Clear intermediate tensors to save memory
-            del qformer_outputs, refined_query_embeds, attention_importance, deviation_scores, patch_scores
+            # Clear intermediate tensors (but keep current_query_tokens!)
+            del qformer_outputs, attention_importance, deviation_scores, patch_scores
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
-        return current_patches, current_indices
+        # ── FINAL STEP: One more attention pass on n_min patches with accumulated queries ──
+        # This is the final refinement before using queries for scoring all 256 patches
+        final_image_embeds = torch.cat([cls_token, current_patches], dim=1)  # (B, n_min+1, D)
+        final_image_atts = torch.ones(
+            final_image_embeds.size()[:-1],
+            dtype=torch.long,
+            device=final_image_embeds.device,
+        )
+        
+        final_qformer_outputs = qformer(
+            query_embeds=current_query_tokens,  # Use accumulated refined queries
+            encoder_hidden_states=final_image_embeds,
+            encoder_attention_mask=final_image_atts,
+        )
+        final_refined_queries = final_qformer_outputs.last_hidden_state  # (B, Q, D_q)
+        
+        return current_patches, current_indices, final_refined_queries
 
 
 class QueryPatchAttention(nn.Module):

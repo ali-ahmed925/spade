@@ -172,7 +172,7 @@ class SPADE(nn.Module):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        refined_patches, selected_indices = self.hpa(
+        refined_patches, selected_indices, final_refined_queries = self.hpa(
             patch_embeds=patch_embeds,
             qformer=self.qformer.qformer,  # Pass Q-Former module
             query_tokens=query_tokens,  # Pass query tokens
@@ -181,30 +181,16 @@ class SPADE(nn.Module):
             cls_token=cls_token,
             alpha=self.score_alpha,
             beta=self.score_beta,
-        )  # (B, N_min, D), (B, N_min)
+        )  # (B, N_min, D), (B, N_min), (B, Q, D_q)
         
         # Clear cache after refinement
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # 5. Final scoring: refined queries attend to ALL 256 patches
-        # Re-compute queries on refined patches one more time
-        refined_image_embeds = torch.cat([cls_token, refined_patches], dim=1)  # (B, N_min+1, D)
-        refined_image_atts = torch.ones(
-            refined_image_embeds.size()[:-1],
-            dtype=torch.long,
-            device=refined_image_embeds.device,
-        )
-        
-        final_query_embeds = self.qformer.qformer(
-            query_embeds=query_tokens,
-            encoder_hidden_states=refined_image_embeds,
-            encoder_attention_mask=refined_image_atts,
-        ).last_hidden_state  # (B, Q, D_q)
-        
-        # Attend to ALL original 256 patches with refined queries
+        # 5. Final scoring: Use accumulated refined queries to attend to ALL 256 patches
+        # No need to recompute - use the queries returned from HPA (already refined through all steps)
         final_attn_weights, final_attn_importance = self.query_patch_attn(
-            final_query_embeds, patch_embeds  # All patches, not just refined
+            final_refined_queries, patch_embeds  # ✅ Use accumulated refined queries on all patches
         )  # (B, N)
         
         # Final Mahalanobis scores on all patches
