@@ -350,6 +350,18 @@ def main() -> None:
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
     ).to(device)
 
+    # Enable frequency features if configured (before loading checkpoint)
+    if cfg.get("frequency", {}).get("enabled", False):
+        model.enable_frequency_features(
+            freq_num_bands=cfg["frequency"].get("num_bands", 6),
+            freq_use_phase=cfg["frequency"].get("use_phase", True),
+            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
+            score_gamma=cfg["scoring"].get("gamma", 0.25),
+        )
+        logger.info("Frequency features enabled")
+    else:
+        logger.info("Frequency features disabled")
+
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)
     if "model_state_dict" in state:
         # Load only trainable parameters (Q-Former + custom heads)
@@ -364,6 +376,45 @@ def main() -> None:
         model.load_state_dict(state, strict=False)
         checkpoint_epoch = "unknown"
         logger.info(f"Loaded checkpoint: {args.checkpoint} (legacy format)")
+    
+    # ⚠️ CRITICAL: Set HPA enabled/disabled AFTER loading checkpoint
+    # Use runtime config (not checkpoint config) to allow testing different settings
+    use_hpa = cfg.get("hpa", {}).get("enabled", True)
+    
+    # ⚠️ CRITICAL: Check if checkpoint config is trying to override (warn but don't use it)
+    if "config" in state and "hpa" in state["config"]:
+        checkpoint_hpa_enabled = state["config"]["hpa"].get("enabled", None)
+        if checkpoint_hpa_enabled is not None and checkpoint_hpa_enabled != use_hpa:
+            logger.warning(
+                f"⚠️ CHECKPOINT CONFIG MISMATCH: "
+                f"Checkpoint was saved with HPA enabled={checkpoint_hpa_enabled}, "
+                f"but runtime config has HPA enabled={use_hpa}. "
+                f"Using RUNTIME config (HPA enabled={use_hpa})."
+            )
+    
+    # ⚠️ CRITICAL: Force set use_hpa and verify it's actually set
+    model.use_hpa = use_hpa
+    logger.info(f"🔧 SET model.use_hpa = {use_hpa} (type: {type(use_hpa)})")
+    
+    # ⚠️ CRITICAL: Verify it's actually set correctly
+    if model.use_hpa != use_hpa:
+        logger.error(f"❌ CRITICAL BUG: model.use_hpa ({model.use_hpa}) != config ({use_hpa})! Fixing...")
+        model.use_hpa = use_hpa
+        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa}")
+    
+    # ⚠️ CRITICAL: Double-check it's a boolean
+    if not isinstance(model.use_hpa, bool):
+        logger.error(f"❌ CRITICAL BUG: model.use_hpa is not a boolean! Value: {model.use_hpa}, type: {type(model.use_hpa)}")
+        model.use_hpa = bool(use_hpa)
+        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa} (forced to boolean)")
+    
+    if model.use_hpa:
+        logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
+    else:
+        logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
+    
+    # Verify HPA setting is correct (double-check after potential state_dict loading)
+    logger.info(f"⚠️ FINAL VERIFICATION: model.use_hpa = {model.use_hpa} (type: {type(model.use_hpa)}, should match config: {use_hpa})")
 
     # ── Evaluate ──
     results = evaluate(

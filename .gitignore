@@ -15,6 +15,7 @@ datasets/
 
 # Logs
 logs/
+debug_logs/
 
 # Models
 *.pth

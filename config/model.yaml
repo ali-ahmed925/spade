@@ -10,6 +10,7 @@ vit:
 
 # ── Hierarchical Patch Annealing (HPA) ──
 hpa:
+  enabled: false                            # Enable HPA (set to false to score all patches directly)
   n_max: 256                              # Starting patches
   n_min: 32                               # Minimum patches at final step
   t_steps: 8                              # Total refinement steps (reduced for memory efficiency)
@@ -19,11 +20,19 @@ hpa:
 
 # ── Patch Scoring ──
 scoring:
-  alpha: 0.4                              # Attention importance weight
-  beta: 0.4                               # Mahalanobis deviation weight
-  lambda: 0.2                             # Cross-term weight
+  alpha: 0.7                              # Attention importance weight (MUCH HIGHER - HPA's main contribution)
+  beta: 0.1                               # Spatial Mahalanobis deviation weight (MINIMAL - least important)
+  gamma: 0.15                             # Frequency Mahalanobis deviation weight (MODERATE - second priority)
+  lambda: 0.05                            # Cross-term weight (MINIMAL)
   mahalanobis_gamma: 1.3                  # Non-linear amplification factor
   mahalanobis_reg: 1e-6                   # Covariance regularization
+
+# ── Frequency Features (NEW) ──
+frequency:
+  enabled: true                           # Enable frequency feature extraction
+  feature_dim: 32                         # Output feature dimension
+  num_bands: 6                            # Number of frequency bands
+  use_phase: true                          # Include phase information
 
 # ── Normal Statistics ──
 normal_stats:

@@ -6,6 +6,20 @@ Properly re-computes query attention at each refinement step.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from utils.debug_logger import get_debug_logger
+
+# Initialize debug logger (shared with SPADE logger)
+_debug_logger = get_debug_logger("spade_debug")
+
+
+def _qformer_checkpoint_wrapper(qformer, query_embeds, encoder_hidden_states, encoder_attention_mask):
+    """Wrapper for Q-Former forward pass to use with gradient checkpointing."""
+    return qformer(
+        query_embeds=query_embeds,
+        encoder_hidden_states=encoder_hidden_states,
+        encoder_attention_mask=encoder_attention_mask,
+    )
 
 
 class HybridPatchAnnealing(nn.Module):
@@ -59,11 +73,16 @@ class HybridPatchAnnealing(nn.Module):
         cls_token: torch.Tensor,
         alpha: float = 0.5,
         beta: float = 0.5,
+        # NEW: Frequency scoring
+        freq_scores: torch.Tensor | None = None,  # (B, N) - precomputed for ALL patches
+        gamma: float = 0.25,  # Weight for frequency component
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform hierarchical patch refinement with attention re-computation.
         
         Queries are accumulated across refinement steps: each iteration uses the
         refined queries from the previous step, allowing hierarchical refinement.
+        
+        Now supports dual-stream scoring: spatial + frequency.
         
         Args:
             patch_embeds: (B, N, D) patch embeddings (without CLS).
@@ -73,7 +92,9 @@ class HybridPatchAnnealing(nn.Module):
             mahalanobis_scorer: Mahalanobis scoring module.
             cls_token: (B, 1, D) CLS token.
             alpha: Weight for attention importance.
-            beta: Weight for deviation.
+            beta: Weight for spatial deviation.
+            freq_scores: (B, N) precomputed frequency Mahalanobis scores for ALL patches.
+            gamma: Weight for frequency deviation.
             
         Returns:
             (refined_patches, selected_indices, final_refined_queries)
@@ -88,11 +109,19 @@ class HybridPatchAnnealing(nn.Module):
         # ── CRITICAL: Initialize query tokens and accumulate refinement ──
         current_query_tokens = query_tokens.clone()  # Start with original learnable tokens
         
+        # DEBUG: Track query statistics at each step
+        initial_mean = current_query_tokens.mean().item()
+        initial_std = current_query_tokens.std().item()
+        initial_norm = current_query_tokens.norm(dim=-1).mean().item()
+        _debug_logger.debug(f"[HPA DEBUG] Step 0 (initial): N={N}, query_mean={initial_mean:.4f}, query_std={initial_std:.4f}, query_norm={initial_norm:.4f}")
+        
         # Hierarchical refinement steps
         for t in range(self.t_steps):
             n_t = self.compute_n_t(t)
             
-            if current_patches.shape[1] <= n_t:
+            # Only break if we've already reached n_min (can't prune further)
+            # Don't break if n_t >= current_patches (we still want to refine queries)
+            if current_patches.shape[1] <= self.n_min:
                 break
             
             # ── Re-compute attention on current patch subset ──
@@ -105,12 +134,36 @@ class HybridPatchAnnealing(nn.Module):
             )
             
             # Re-run Q-Former with accumulated refined queries
-            qformer_outputs = qformer(
-                query_embeds=current_query_tokens,  # ✅ Use accumulated refined queries
-                encoder_hidden_states=current_image_embeds,
-                encoder_attention_mask=image_atts,
-            )
+            # Use gradient checkpointing to save memory during training
+            if self.training and t > 0:  # Skip checkpointing on first step (less memory pressure)
+                # Gradient checkpointing: trade compute for memory
+                # Only checkpoint intermediate steps, not the first one
+                qformer_outputs = checkpoint(
+                    _qformer_checkpoint_wrapper,
+                    qformer,
+                    current_query_tokens,
+                    current_image_embeds,
+                    image_atts,
+                    use_reentrant=False,
+                )
+            else:
+                # No checkpointing during eval or first step (faster)
+                qformer_outputs = qformer(
+                    query_embeds=current_query_tokens,  # ✅ Use accumulated refined queries
+                    encoder_hidden_states=current_image_embeds,
+                    encoder_attention_mask=image_atts,
+                )
             refined_query_embeds = qformer_outputs.last_hidden_state  # (B, Q, D_q)
+            
+            # DEBUG: Track query change
+            query_change = (refined_query_embeds - current_query_tokens).abs().mean().item()
+            refined_mean = refined_query_embeds.mean().item()
+            refined_std = refined_query_embeds.std().item()
+            refined_norm = refined_query_embeds.norm(dim=-1).mean().item()
+            
+            _debug_logger.debug(f"[HPA DEBUG] Step {t+1}: N={current_patches.shape[1]}→{n_t}, "
+                  f"query_change={query_change:.6f}, "
+                  f"mean={refined_mean:.4f}, std={refined_std:.4f}, norm={refined_norm:.4f}")
             
             # ── CRITICAL: Update query tokens for next iteration ──
             current_query_tokens = refined_query_embeds  # ✅ Accumulate refinement
@@ -120,13 +173,25 @@ class HybridPatchAnnealing(nn.Module):
                 refined_query_embeds, current_patches
             )  # (B, N_t)
             
-            # 3. Re-compute Mahalanobis deviation on current patches
-            deviation_scores = mahalanobis_scorer(current_patches)  # (B, N_t)
+            # 3. Re-compute Mahalanobis deviation on current patches (RAW - no normalization)
+            spatial_mahal = mahalanobis_scorer(current_patches)  # (B, N_t)
             
-            # 4. Compute patch scores for selection
-            patch_scores = alpha * attention_importance + beta * deviation_scores  # (B, N_t)
+            # 4. Get frequency scores for current patches (RAW - no normalization)
+            if freq_scores is not None:
+                # Gather frequency scores using current_indices
+                batch_indices = torch.arange(B, device=patch_embeds.device).unsqueeze(1)
+                current_freq_mahal = freq_scores[batch_indices, current_indices]  # (B, N_t)
+            else:
+                current_freq_mahal = torch.zeros_like(spatial_mahal)
             
-            # 5. Select top-N_t patches
+            # 5. ⭐ COMBINED SCORING (spatial + frequency) - Using RAW Mahalanobis scores
+            patch_scores = (
+                alpha * attention_importance +
+                beta * spatial_mahal +
+                gamma * current_freq_mahal
+            )  # (B, N_t)
+            
+            # 6. Select top-N_t patches
             _, top_indices_local = torch.topk(patch_scores, n_t, dim=1)  # (B, n_t)
             
             # Map local indices back to global indices
@@ -138,7 +203,9 @@ class HybridPatchAnnealing(nn.Module):
             cls_token = current_patches.mean(dim=1, keepdim=True)
             
             # Clear intermediate tensors (but keep current_query_tokens!)
-            del qformer_outputs, attention_importance, deviation_scores, patch_scores
+            del qformer_outputs, attention_importance, spatial_mahal, patch_scores
+            if freq_scores is not None:
+                del current_freq_mahal
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
@@ -151,12 +218,32 @@ class HybridPatchAnnealing(nn.Module):
             device=final_image_embeds.device,
         )
         
-        final_qformer_outputs = qformer(
-            query_embeds=current_query_tokens,  # Use accumulated refined queries
-            encoder_hidden_states=final_image_embeds,
-            encoder_attention_mask=final_image_atts,
-        )
+        # Final step: Use gradient checkpointing during training
+        if self.training:
+            final_qformer_outputs = checkpoint(
+                _qformer_checkpoint_wrapper,
+                qformer,
+                current_query_tokens,
+                final_image_embeds,
+                final_image_atts,
+                use_reentrant=False,
+            )
+        else:
+            final_qformer_outputs = qformer(
+                query_embeds=current_query_tokens,  # Use accumulated refined queries
+                encoder_hidden_states=final_image_embeds,
+                encoder_attention_mask=final_image_atts,
+            )
         final_refined_queries = final_qformer_outputs.last_hidden_state  # (B, Q, D_q)
+        
+        # DEBUG: Final step stats
+        final_mean = final_refined_queries.mean().item()
+        final_std = final_refined_queries.std().item()
+        final_norm = final_refined_queries.norm(dim=-1).mean().item()
+        total_change = (final_refined_queries - query_tokens).abs().mean().item()
+        
+        _debug_logger.debug(f"[HPA DEBUG] Final step: query_mean={final_mean:.4f}, query_std={final_std:.4f}, "
+              f"query_norm={final_norm:.4f}, total_change_from_initial={total_change:.6f}")
         
         return current_patches, current_indices, final_refined_queries
 

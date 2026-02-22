@@ -77,6 +77,19 @@ def train_one_epoch(
             patch_labels=patch_labels,
             update_stats=True,  # Update normal statistics during training
         )
+        
+        # ⚠️ CRITICAL: Verify HPA is actually affecting patch scores during training
+        patch_scores = outputs["patch_scores"]
+        if step == 0 and epoch == 1:
+            import hashlib
+            patch_scores_bytes = patch_scores.detach().cpu().numpy().tobytes()
+            patch_scores_hash = hashlib.md5(patch_scores_bytes).hexdigest()[:8]
+            score_mean = patch_scores.mean().item()
+            score_max = patch_scores.max().item()
+            score_min = patch_scores.min().item()
+            logger.info(f"Epoch {epoch} Step {step}: HPA enabled={model.use_hpa}, "
+                  f"scores mean={score_mean:.4f}, min={score_min:.4f}, max={score_max:.4f}, "
+                  f"hash={patch_scores_hash}")
 
         # Loss: With normal-only training, all patch_labels = 0 (normal patches)
         # Loss pushes patch_scores → 0 for normal patches
@@ -84,19 +97,11 @@ def train_one_epoch(
         # Mahalanobis learns normal distribution
         # At test time, anomalies have high Mahalanobis distance → high scores → detected
         losses = criterion(
-            patch_scores=outputs["patch_scores"],
+            patch_scores=patch_scores,
             patch_targets=patch_labels,  # All zeros for normal-only training
             query_embeds=outputs["query_embeds"],
             labels=labels,  # All zeros for normal-only training
         )
-        
-        # Debug: Log score statistics to see if they're changing
-        if step == 0 and epoch == 1:
-            with torch.no_grad():
-                score_mean = outputs["patch_scores"].mean().item()
-                score_max = outputs["patch_scores"].max().item()
-                score_min = outputs["patch_scores"].min().item()
-                logger.info(f"Epoch {epoch} Step {step}: scores mean={score_mean:.4f}, min={score_min:.4f}, max={score_max:.4f}")
 
         # Backward
         optimizer.zero_grad()
@@ -366,6 +371,44 @@ def main() -> None:
         normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
     ).to(device)
+
+    # Enable/disable HPA based on config
+    use_hpa = cfg.get("hpa", {}).get("enabled", True)
+    
+    # ⚠️ CRITICAL: Force set and verify
+    model.use_hpa = use_hpa
+    logger.info(f"🔧 SET model.use_hpa = {use_hpa} (type: {type(use_hpa)})")
+    
+    # ⚠️ CRITICAL: Verify it's actually set correctly
+    if model.use_hpa != use_hpa:
+        logger.error(f"❌ CRITICAL BUG: model.use_hpa ({model.use_hpa}) != config ({use_hpa})! Fixing...")
+        model.use_hpa = use_hpa
+        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa}")
+    
+    # ⚠️ CRITICAL: Double-check it's a boolean
+    if not isinstance(model.use_hpa, bool):
+        logger.error(f"❌ CRITICAL BUG: model.use_hpa is not a boolean! Value: {model.use_hpa}, type: {type(model.use_hpa)}")
+        model.use_hpa = bool(use_hpa)
+        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa} (forced to boolean)")
+    
+    if model.use_hpa:
+        logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
+    else:
+        logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
+    
+    logger.info(f"⚠️ FINAL VERIFICATION: model.use_hpa = {model.use_hpa} (type: {type(model.use_hpa)})")
+    
+    # Enable frequency features if configured
+    if cfg.get("frequency", {}).get("enabled", False):
+        model.enable_frequency_features(
+            freq_num_bands=cfg["frequency"].get("num_bands", 6),
+            freq_use_phase=cfg["frequency"].get("use_phase", True),
+            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
+            score_gamma=cfg["scoring"].get("gamma", 0.25),
+        )
+        logger.info("Frequency features enabled")
+    else:
+        logger.info("Frequency features disabled")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())

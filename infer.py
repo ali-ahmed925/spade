@@ -70,6 +70,26 @@ def main() -> None:
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
     ).to(device)
 
+    # Enable/disable HPA based on config
+    use_hpa = cfg.get("hpa", {}).get("enabled", True)
+    model.use_hpa = use_hpa
+    if use_hpa:
+        logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
+    else:
+        logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
+    
+    # Enable frequency features if configured
+    if cfg.get("frequency", {}).get("enabled", False):
+        model.enable_frequency_features(
+            freq_num_bands=cfg["frequency"].get("num_bands", 6),
+            freq_use_phase=cfg["frequency"].get("use_phase", True),
+            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
+            score_gamma=cfg["scoring"].get("gamma", 0.25),
+        )
+        logger.info("Frequency features enabled")
+    else:
+        logger.info("Frequency features disabled")
+
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)
     if "model_state_dict" in state:
         # Load only trainable parameters (Q-Former + custom heads)
