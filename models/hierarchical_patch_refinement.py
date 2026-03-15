@@ -69,7 +69,7 @@ class HybridPatchAnnealing(nn.Module):
         qformer: nn.Module,
         query_tokens: torch.Tensor,
         query_patch_attn: nn.Module,
-        mahalanobis_scorer: nn.Module,
+        mahalanobis_scorer: nn.Module | None,  # Can be None if Mahalanobis is disabled
         cls_token: torch.Tensor,
         alpha: float = 0.5,
         beta: float = 0.5,
@@ -174,7 +174,14 @@ class HybridPatchAnnealing(nn.Module):
             )  # (B, N_t)
             
             # 3. Re-compute Mahalanobis deviation on current patches (RAW - no normalization)
-            spatial_mahal = mahalanobis_scorer(current_patches)  # (B, N_t)
+            if mahalanobis_scorer is not None:
+                spatial_mahal = mahalanobis_scorer(current_patches)  # (B, N_t)
+            else:
+                # Mahalanobis disabled - return zeros
+                spatial_mahal = torch.zeros(
+                    current_patches.shape[0], current_patches.shape[1],
+                    device=current_patches.device, dtype=current_patches.dtype
+                )  # (B, N_t)
             
             # 4. Get frequency scores for current patches (RAW - no normalization)
             if freq_scores is not None:
@@ -260,27 +267,38 @@ class QueryPatchAttention(nn.Module):
         self,
         query_embeds: torch.Tensor,
         patch_embeds: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_raw_scores: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute query-patch attention.
         
         Args:
             query_embeds: (B, Q, D_q) query embeddings.
             patch_embeds: (B, N, D_p) patch embeddings.
+            return_raw_scores: If True, also return raw attention scores (before softmax).
             
         Returns:
-            (attention_weights, attention_importance)
-            - attention_weights: (B, Q, N) attention weights.
-            - attention_importance: (B, N) aggregated importance per patch.
+            If return_raw_scores=False:
+                (attention_weights, attention_importance)
+            If return_raw_scores=True:
+                (attention_weights, attention_importance, raw_attention_scores)
+            - attention_weights: (B, Q, N) attention weights (after softmax).
+            - attention_importance: (B, N) aggregated importance per patch (sum of softmax weights).
+            - raw_attention_scores: (B, N) raw attention scores summed across queries (before softmax).
         """
         # Project queries to patch dimension
         queries = self.query_proj(query_embeds)  # (B, Q, D_p)
         
         # Compute attention
-        attn_scores = torch.bmm(queries, patch_embeds.transpose(1, 2)) * self.scale
+        attn_scores = torch.bmm(queries, patch_embeds.transpose(1, 2)) * self.scale  # (B, Q, N)
         attn_weights = F.softmax(attn_scores, dim=-1)  # (B, Q, N)
         
         # Aggregate importance: sum over queries
         attention_importance = attn_weights.sum(dim=1)  # (B, N)
         
-        return attn_weights, attention_importance
+        if return_raw_scores:
+            # Sum raw scores across queries (before softmax)
+            raw_attention_scores = attn_scores.sum(dim=1)  # (B, N)
+            return attn_weights, attention_importance, raw_attention_scores
+        else:
+            return attn_weights, attention_importance
 

@@ -12,7 +12,7 @@ training:
   checkpoint_dir: "./checkpoints"
   early_stopping:
     enabled: true
-    patience: 10                          # epochs to wait before stopping
+    patience: 5                            # epochs to wait before stopping (when both metrics don't improve)
     mode: "max"                            # "max" for AUROC, "min" for loss
     min_delta: 0.001                      # minimum change to qualify as improvement
   checkpoint:
@@ -42,7 +42,7 @@ loss:
   var_weight: 0.1              # Weight for variance term in Mahalanobis loss (encourages tight clustering)
   use_pseudo: true           # Use pseudo-anomaly loss for contrastive learning
   pseudo_epsilon: 0.01       # Perturbation magnitude for pseudo-anomaly loss
-  clamp_max: 100.0            # Maximum score for soft clipping
+  clamp_max: 1000.0           # Maximum score for soft clipping (increased to handle Mahalanobis scores ~450+)
 
 
 

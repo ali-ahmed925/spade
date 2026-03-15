@@ -62,12 +62,18 @@ def main() -> None:
         # Scoring parameters
         score_alpha=cfg["scoring"]["alpha"],
         score_beta=cfg["scoring"]["beta"],
+        score_gamma=cfg["scoring"].get("gamma", 0.25),  # Frequency weight
         score_lambda=cfg["scoring"]["lambda"],
         mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
         mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
+        use_mahalanobis=cfg["scoring"].get("use_mahalanobis", True),
         # Normal statistics parameters
         normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
+        # Attention verification
+        verify_attention=cfg["scoring"].get("verify_attention", False),
+        # Raw attention mode
+        use_raw_attention=cfg["scoring"].get("use_raw_attention", True),
     ).to(device)
 
     # Enable/disable HPA based on config
@@ -77,6 +83,12 @@ def main() -> None:
         logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
     else:
         logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
+    
+    # Log Mahalanobis status
+    if model.use_mahalanobis:
+        logger.info("✅ Mahalanobis scoring enabled")
+    else:
+        logger.info("❌ Mahalanobis scoring DISABLED - using only attention scores")
     
     # Enable frequency features if configured
     if cfg.get("frequency", {}).get("enabled", False):

@@ -10,8 +10,8 @@ class MahalanobisScoring(nn.Module):
     def __init__(
         self,
         feature_dim: int,
-        regularization: float = 1e-6,
-        gamma: float = 1.3,
+        regularization: float = 1e-4,
+        gamma: float = 1.0,  # Changed from 1.3 to 1.0 (no amplification)
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -26,18 +26,18 @@ class MahalanobisScoring(nn.Module):
     def update_statistics(
         self,
         normal_patches: torch.Tensor,
-        momentum: float = 0.1,
+        momentum: float = None,  # Deprecated, kept for backward compatibility
     ):
-        """Update μ and Σ from normal patches.
+        """Compute μ and Σ from all normal patches (one-time computation, no momentum).
         
         Args:
             normal_patches: (N_normal, D) normal patch embeddings.
-            momentum: Exponential moving average momentum.
+            momentum: Ignored (kept for backward compatibility).
         """
         if normal_patches.numel() == 0:
             return
         
-        # Compute statistics
+        # Compute statistics from ALL patches (no incremental updates)
         mu_new = normal_patches.mean(dim=0)
         centered = normal_patches - mu_new.unsqueeze(0)
         sigma_new = (centered.T @ centered) / (normal_patches.shape[0] - 1)
@@ -61,17 +61,10 @@ class MahalanobisScoring(nn.Module):
         eye_matrix = torch.eye(feature_dim_int, device=device, dtype=dtype)
         sigma_new = sigma_new + reg_value * eye_matrix
         
-        # Update with momentum
-        if not self.is_initialized:
-            self.mu.data = mu_new
-            self.sigma_inv.data = torch.linalg.inv(sigma_new)
-            self.is_initialized.data = torch.tensor(True)
-        else:
-            self.mu.data = (1 - momentum) * self.mu + momentum * mu_new
-            sigma_updated = (1 - momentum) * (
-                torch.linalg.inv(self.sigma_inv) 
-            ) + momentum * sigma_new
-            self.sigma_inv.data = torch.linalg.inv(sigma_updated)
+        # Set statistics directly (no momentum, compute once from all data)
+        self.mu.data = mu_new
+        self.sigma_inv.data = torch.linalg.inv(sigma_new)
+        self.is_initialized.data = torch.tensor(True)
     
     def forward(
         self,

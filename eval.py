@@ -311,6 +311,31 @@ def main() -> None:
         logger.info("Logging evaluation to Weights & Biases")
 
     # ── Dataset ──
+    # Exclude validation samples from test evaluation (if validation used real test split)
+    val_cfg = cfg.get("validation", {})
+    use_real_val = val_cfg.get("use_real_test", True)
+    test_indices = None
+    
+    if use_real_val and val_cfg.get("enabled", True):
+        # Replicate the validation split logic to exclude validation samples
+        full_test_dataset = MVTecDataset(
+            root=cfg["dataset"]["root"],
+            category=cfg["dataset"]["category"],
+            split="test",
+            image_size=cfg["vit"]["image_size"],
+            patch_size=cfg["vit"]["patch_size"],
+            synthetic_method=None,
+        )
+        n_test = len(full_test_dataset)
+        val_size = n_test // 2
+        rng = np.random.RandomState(int(val_cfg.get("seed", 42)))
+        perm = rng.permutation(n_test).tolist()
+        val_indices_test = set(perm[:val_size])  # Validation indices
+        # Test indices = all indices NOT in validation
+        test_indices = [i for i in range(n_test) if i not in val_indices_test]
+        logger.info(f"Excluding {len(val_indices_test)} validation samples from test evaluation")
+        logger.info(f"Test samples (excluding validation): {len(test_indices)}")
+    
     dataset = MVTecDataset(
         root=cfg["dataset"]["root"],
         category=cfg["dataset"]["category"],
@@ -318,6 +343,7 @@ def main() -> None:
         image_size=cfg["vit"]["image_size"],
         patch_size=cfg["vit"]["patch_size"],
         synthetic_method=None,
+        subset_indices=test_indices,  # Only evaluate on truly unseen test samples
     )
     loader = DataLoader(
         dataset,
@@ -342,12 +368,18 @@ def main() -> None:
         # Scoring parameters
         score_alpha=cfg["scoring"]["alpha"],
         score_beta=cfg["scoring"]["beta"],
+        score_gamma=cfg["scoring"].get("gamma", 0.25),  # Frequency weight
         score_lambda=cfg["scoring"]["lambda"],
         mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
         mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
+        use_mahalanobis=cfg["scoring"].get("use_mahalanobis", True),
         # Normal statistics parameters
         normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
+        # Attention verification
+        verify_attention=cfg["scoring"].get("verify_attention", False),
+        # Raw attention mode
+        use_raw_attention=cfg["scoring"].get("use_raw_attention", True),
     ).to(device)
 
     # Enable frequency features if configured (before loading checkpoint)
@@ -371,11 +403,26 @@ def main() -> None:
         logger.info(f"Loaded checkpoint: {args.checkpoint} (epoch: {checkpoint_epoch})")
         if "config" in state:
             logger.info(f"Checkpoint config: {state['config']}")
+        
+        # Verify running statistics were loaded
+        running_stats_loaded = all(
+            k in state["model_state_dict"] for k in 
+            ["attn_mean", "attn_std", "spatial_mean", "spatial_std", "freq_mean", "freq_std"]
+        )
+        if running_stats_loaded:
+            logger.info(f"✅ Running statistics loaded: attn(μ={model.attn_mean.item():.2f}, σ={model.attn_std.item():.2f}), "
+                       f"spatial(μ={model.spatial_mean.item():.2f}, σ={model.spatial_std.item():.2f}), "
+                       f"freq(μ={model.freq_mean.item():.2f}, σ={model.freq_std.item():.2f})")
+        else:
+            logger.warning("⚠️ Running statistics NOT found in checkpoint - will use initial values (may cause poor performance)")
     else:
         # Legacy format: assume full state_dict
         model.load_state_dict(state, strict=False)
         checkpoint_epoch = "unknown"
         logger.info(f"Loaded checkpoint: {args.checkpoint} (legacy format)")
+    
+    # ⚠️ CRITICAL: Move model to device AFTER loading checkpoint to ensure all buffers are on correct device
+    model = model.to(device)
     
     # ⚠️ CRITICAL: Set HPA enabled/disabled AFTER loading checkpoint
     # Use runtime config (not checkpoint config) to allow testing different settings
@@ -412,6 +459,12 @@ def main() -> None:
         logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
     else:
         logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
+    
+    # Log Mahalanobis status
+    if model.use_mahalanobis:
+        logger.info("✅ Mahalanobis scoring enabled")
+    else:
+        logger.info("❌ Mahalanobis scoring DISABLED - using only attention scores")
     
     # Verify HPA setting is correct (double-check after potential state_dict loading)
     logger.info(f"⚠️ FINAL VERIFICATION: model.use_hpa = {model.use_hpa} (type: {type(model.use_hpa)}, should match config: {use_hpa})")

@@ -44,12 +44,18 @@ class SPADE(nn.Module):
         # Scoring parameters
         score_alpha: float = 0.4,
         score_beta: float = 0.4,
+        score_gamma: float = 0.25,  # Frequency weight (moved from enable_frequency_features)
         score_lambda: float = 0.2,
         mahalanobis_gamma: float = 1.3,
         mahalanobis_reg: float = 1e-6,
+        use_mahalanobis: bool = True,  # Enable/disable Mahalanobis scoring
         # Normal statistics parameters
         normal_stats_buffer_size: int = 10000,
         normal_stats_update_frequency: int = 100,
+        # Attention verification
+        verify_attention: bool = False,  # Enable attention verification (logs and visualizes)
+        # Raw attention mode
+        use_raw_attention: bool = True,  # Use raw attention scores (larger scale, handles negatives)
     ):
         super().__init__()
         
@@ -112,20 +118,45 @@ class SPADE(nn.Module):
             output_dim=llm_embed_dim,
         )
         
-        # Scoring weights
-        self.score_alpha = score_alpha
-        self.score_beta = score_beta
-        self.score_lambda = score_lambda
+        # Scoring weights - Learnable parameters (will be optimized during training)
+        self.score_alpha = nn.Parameter(torch.tensor(score_alpha))
+        self.score_beta = nn.Parameter(torch.tensor(score_beta))
+        self.score_gamma = nn.Parameter(torch.tensor(score_gamma))
+        self.score_lambda = nn.Parameter(torch.tensor(score_lambda))
+        
+        # Mahalanobis enabled flag
+        self.use_mahalanobis = use_mahalanobis
         
         # HPA enabled flag (can be set via enable_hpa/disable_hpa)
         self.use_hpa = True  # Default enabled
+        
+        # Attention verification flag
+        self.verify_attention = verify_attention
+        self._verification_run_this_epoch = False  # Track if verification has run this epoch
+        
+        # Raw attention mode: use raw scores instead of softmax probabilities
+        self.use_raw_attention = use_raw_attention  # Enable raw attention scores (larger scale, handles negatives)
+        
+        if self.use_raw_attention:
+            _debug_logger.info(f"✅ Raw attention mode ENABLED - using raw scores (before softmax) with ReLU+shift for negatives")
+        else:
+            _debug_logger.info(f"📊 Softmax attention mode - using probability-based attention (original approach)")
         
         # Frequency feature extractor (optional, enabled via enable_frequency_features)
         self.use_frequency = False
         self.freq_extractor = None
         self.freq_mahalanobis_scorer = None
         self.freq_normal_stats_tracker = None
-        self.score_gamma = 0.25  # Default, can be set via enable_frequency_features
+        
+        # Running statistics for standardization (computed from training data)
+        # These accumulate during training and are used for fixed normalization
+        self.register_buffer('attn_mean', torch.tensor(0.0))
+        self.register_buffer('attn_std', torch.tensor(1.0))
+        self.register_buffer('spatial_mean', torch.tensor(0.0))
+        self.register_buffer('spatial_std', torch.tensor(1.0))
+        self.register_buffer('freq_mean', torch.tensor(0.0))
+        self.register_buffer('freq_std', torch.tensor(1.0))
+        self.register_buffer('_stats_count', torch.tensor(0))  # Number of batches used for statistics
         
     def forward(
         self,
@@ -167,21 +198,10 @@ class SPADE(nn.Module):
             encoder_attention_mask=image_atts,
         ).last_hidden_state  # (B, Q, D_q)
         
-        # 3. Update normal statistics if training
-        if update_stats and patch_labels is not None:
+        # 3. Collect normal patches for statistics (only if Mahalanobis is enabled)
+        # Statistics will be computed once after collecting all patches
+        if self.use_mahalanobis and update_stats and patch_labels is not None:
             self.normal_stats_tracker.add_normal_patches(patch_embeds, patch_labels)
-            # Periodically update Mahalanobis statistics
-            if self.normal_stats_tracker.step_count % self.normal_stats_tracker.update_frequency == 0:
-                mu, sigma = self.normal_stats_tracker.get_statistics()
-                if mu is not None:
-                    normal_patches = torch.stack(list(self.normal_stats_tracker.normal_patch_buffer))
-                    # Move to same device as model
-                    normal_patches = normal_patches.to(patch_embeds.device)
-                    self.mahalanobis_scorer.update_statistics(normal_patches)
-                    # Clear cache after statistics update
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            self.normal_stats_tracker.step_count += 1
         
         # ═══════════════════════════════════════════════
         # STREAM 2: FREQUENCY FEATURES (parallel)
@@ -206,21 +226,16 @@ class SPADE(nn.Module):
             freq_feature_dim = freq_features.shape[-1]
             freq_features = freq_features.reshape(B, 256, freq_feature_dim)  # (B, 256, freq_feature_dim)
             
-            # Update frequency statistics if training
-            if update_stats and patch_labels is not None:
+            # Collect frequency normal patches for statistics (only if Mahalanobis is enabled)
+            # Statistics will be computed once after collecting all patches
+            if self.use_mahalanobis and update_stats and patch_labels is not None:
                 self.freq_normal_stats_tracker.add_normal_patches(freq_features, patch_labels)
-                if self.freq_normal_stats_tracker.step_count % self.freq_normal_stats_tracker.update_frequency == 0:
-                    mu, sigma = self.freq_normal_stats_tracker.get_statistics()
-                    if mu is not None:
-                        normal_freq = torch.stack(list(self.freq_normal_stats_tracker.normal_patch_buffer))
-                        normal_freq = normal_freq.to(freq_features.device)
-                        self.freq_mahalanobis_scorer.update_statistics(normal_freq)
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                self.freq_normal_stats_tracker.step_count += 1
             
-            # Compute frequency Mahalanobis scores
-            freq_scores = self.freq_mahalanobis_scorer(freq_features)  # (B, 256)
+            # Compute frequency Mahalanobis scores (only if Mahalanobis is enabled)
+            if self.use_mahalanobis:
+                freq_scores = self.freq_mahalanobis_scorer(freq_features)  # (B, 256)
+            else:
+                freq_scores = None  # Disabled
         
         # 4. Hierarchical Patch Refinement (HPA) with attention re-computation
         # DEBUG: Store initial query stats
@@ -245,9 +260,14 @@ class SPADE(nn.Module):
             _debug_logger.debug(f"[SPADE DEBUG] ✅ TAKING HPA ENABLED BRANCH - self.use_hpa={self.use_hpa}")
             
             # DEBUG: Compute attention with initial queries BEFORE HPA (for comparison)
-            initial_attn_weights, initial_attn_importance = self.query_patch_attn(
-                initial_query_embeds, patch_embeds
-            )
+            if self.use_raw_attention or self.verify_attention:
+                initial_attn_weights, initial_attn_importance, _ = self.query_patch_attn(
+                    initial_query_embeds, patch_embeds, return_raw_scores=True
+                )
+            else:
+                initial_attn_weights, initial_attn_importance = self.query_patch_attn(
+                    initial_query_embeds, patch_embeds
+                )
             initial_attn_mean = initial_attn_importance.mean().item()
             _debug_logger.debug(f"[SPADE DEBUG] Initial attention (before HPA) - mean={initial_attn_mean:.4f}")
             
@@ -255,18 +275,21 @@ class SPADE(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
+            # Use dummy scorer if Mahalanobis is disabled
+            mahalanobis_scorer_for_hpa = self.mahalanobis_scorer if self.use_mahalanobis else None
+            
             refined_patches, selected_indices, final_refined_queries = self.hpa(
                 patch_embeds=patch_embeds,
                 qformer=self.qformer.qformer,  # Pass Q-Former module
                 query_tokens=query_tokens,  # Pass query tokens
                 query_patch_attn=self.query_patch_attn,
-                mahalanobis_scorer=self.mahalanobis_scorer,
+                mahalanobis_scorer=mahalanobis_scorer_for_hpa,
                 cls_token=cls_token,
-                alpha=self.score_alpha,
-                beta=self.score_beta,
+                alpha=self.score_alpha.item(),  # Convert learnable parameter to float for HPA
+                beta=self.score_beta.item(),
                 # NEW: Frequency scoring
-                freq_scores=freq_scores,  # Pass precomputed scores
-                gamma=self.score_gamma,
+                freq_scores=freq_scores if self.use_mahalanobis else None,  # Disable freq scores if Mahalanobis disabled
+                gamma=self.score_gamma.item(),
             )  # (B, N_min, D), (B, N_min), (B, Q, D_q)
             
             # DEBUG: Compare initial vs refined queries
@@ -291,9 +314,16 @@ class SPADE(nn.Module):
             # DEBUG: Verify queries are actually different
             query_diff_final = (final_refined_queries - initial_query_embeds).abs().mean().item()
             _debug_logger.debug(f"[SPADE DEBUG] Using REFINED queries for final scoring (diff from initial: {query_diff_final:.6f})")
-            final_attn_weights, final_attn_importance = self.query_patch_attn(
-                final_refined_queries, patch_embeds  # ✅ Use accumulated refined queries on all patches
-            )  # (B, N)
+            # Always get raw scores if using raw attention mode or verification
+            if self.use_raw_attention or self.verify_attention:
+                final_attn_weights, final_attn_importance, raw_attention_scores = self.query_patch_attn(
+                    final_refined_queries, patch_embeds, return_raw_scores=True
+                )  # (B, N), (B, N), (B, N)
+            else:
+                final_attn_weights, final_attn_importance = self.query_patch_attn(
+                    final_refined_queries, patch_embeds  # ✅ Use accumulated refined queries on all patches
+                )  # (B, N)
+                raw_attention_scores = None
             
             # DEBUG: Compare final attention with initial attention
             final_attn_mean = final_attn_importance.mean().item()
@@ -305,18 +335,28 @@ class SPADE(nn.Module):
             # HPA disabled: Use initial query embeddings directly to score all patches
             # 5. Final scoring: Use initial queries to attend to ALL 256 patches
             _debug_logger.debug(f"[SPADE DEBUG] Using INITIAL queries for final scoring (no refinement)")
-            final_attn_weights, final_attn_importance = self.query_patch_attn(
-                initial_query_embeds, patch_embeds  # ✅ Use initial queries on all patches (no refinement)
-            )  # (B, N)
+            # Always get raw scores if using raw attention mode or verification
+            if self.use_raw_attention or self.verify_attention:
+                final_attn_weights, final_attn_importance, raw_attention_scores = self.query_patch_attn(
+                    initial_query_embeds, patch_embeds, return_raw_scores=True
+                )  # (B, N), (B, N), (B, N)
+            else:
+                final_attn_weights, final_attn_importance = self.query_patch_attn(
+                    initial_query_embeds, patch_embeds  # ✅ Use initial queries on all patches (no refinement)
+                )  # (B, N)
+                raw_attention_scores = None
             _debug_logger.debug(f"[SPADE DEBUG] Using initial queries (no refinement)")
             _debug_logger.debug(f"[SPADE DEBUG] Initial queries - mean={initial_query_mean:.4f}, "
                   f"std={initial_query_std:.4f}, norm={initial_query_norm:.4f}")
         
         # Final Mahalanobis scores on all patches (RAW - no normalization)
-        final_spatial_mahal = self.mahalanobis_scorer(patch_embeds)  # (B, N)
+        if self.use_mahalanobis:
+            final_spatial_mahal = self.mahalanobis_scorer(patch_embeds)  # (B, N)
+        else:
+            final_spatial_mahal = torch.zeros_like(patch_embeds[:, :, 0])  # (B, N) - zeros when disabled
         
         # Final frequency Mahalanobis on all patches (RAW - no normalization)
-        if freq_scores is not None:
+        if self.use_mahalanobis and freq_scores is not None:
             final_freq_mahal = freq_scores  # Already computed for all 256 patches
         else:
             final_freq_mahal = torch.zeros_like(final_spatial_mahal)
@@ -346,18 +386,116 @@ class SPADE(nn.Module):
                   f"std={freq_std:.4f}, max={freq_max:.4f}, min={freq_min:.4f}")
         
         # Final patch scores with cross-term
-        # Normalize attention importance to [0, 1] range to prevent extreme values
-        # Attention importance can be very high initially (sum over queries, each in [0,1])
-        # With 32 queries, max attention_importance = 32, which is too high
-        attn_importance_norm = final_attn_importance / (self.qformer.num_queries + 1e-8)  # Normalize by num queries
+        # Option 1: Use raw attention scores (larger scale, better match with Mahalanobis)
+        # Option 2: Use softmax probabilities (smaller scale, [0, Q] range)
+        if self.use_raw_attention and raw_attention_scores is not None:
+            # Use raw attention scores (before softmax, summed across queries)
+            # Raw scores can be negative (dissimilar = anomalous)
+            # Transform: negative attention → positive anomaly score
+            raw_attn = raw_attention_scores  # (B, N) - can be negative
+            
+            # Flip sign: negative attention (dissimilar) → positive anomaly score
+            attention_anomaly = -raw_attn  # (B, N)
+            
+            # Shift per image to make all positive (preserves relative differences)
+            attention_min = attention_anomaly.min(dim=1, keepdim=True)[0]  # (B, 1)
+            attn_importance_norm = attention_anomaly - attention_min  # (B, N) - now min=0 per image, all positive
+            
+            _debug_logger.debug(f"[SPADE DEBUG] Using RAW attention scores - raw mean={raw_attn.mean().item():.4f}, "
+                  f"transformed mean={attn_importance_norm.mean().item():.4f}, "
+                  f"transformed max={attn_importance_norm.max().item():.4f}")
+        else:
+            # Use softmax probabilities (original approach)
+            # Each query's attention weights sum to 1.0, so summing over Q queries gives [0, Q] range
+            attn_importance_norm = final_attn_importance  # (B, N) - already properly scaled
+            _debug_logger.debug(f"[SPADE DEBUG] Using SOFTMAX attention (original approach)")
         
-        # ⭐ COMBINED FINAL SCORES (spatial + frequency) - Using RAW Mahalanobis scores
+        # 🔥 Step 1: Log-transform Mahalanobis (handles quadratic growth, preserves ranking)
+        # log1p(x) = log(1 + x) handles zeros gracefully and compresses large values
+        spatial_energy = torch.log1p(final_spatial_mahal)  # (B, N)
+        freq_energy = torch.log1p(final_freq_mahal) if freq_scores is not None else torch.zeros_like(final_spatial_mahal)  # (B, N)
+        
+        # DEBUG: Log energy values (after log-transform)
+        spatial_energy_mean = spatial_energy.mean().item()
+        spatial_energy_std = spatial_energy.std().item()
+        _debug_logger.debug(f"[SPADE DEBUG] Spatial energy (log1p) - mean={spatial_energy_mean:.4f}, std={spatial_energy_std:.4f}")
+        if freq_scores is not None:
+            freq_energy_mean = freq_energy.mean().item()
+            freq_energy_std = freq_energy.std().item()
+            _debug_logger.debug(f"[SPADE DEBUG] Frequency energy (log1p) - mean={freq_energy_mean:.4f}, std={freq_energy_std:.4f}")
+        
+        # 🔥 Step 2: Standardize each modality using fixed statistics (computed from training data)
+        # CRITICAL: Use running statistics (like BatchNorm) to preserve absolute scale across batches
+        # During training: accumulate statistics; during eval: use fixed statistics
+        if self.training:
+            # Update running statistics during training
+            batch_attn_mean = attn_importance_norm.mean()
+            batch_attn_std = attn_importance_norm.std()
+            batch_spatial_mean = spatial_energy.mean()
+            batch_spatial_std = spatial_energy.std()
+            batch_freq_mean = freq_energy.mean()
+            batch_freq_std = freq_energy.std()
+            
+            # Exponential moving average (momentum=0.1, like BatchNorm)
+            momentum = 0.1
+            self.attn_mean = (1 - momentum) * self.attn_mean + momentum * batch_attn_mean
+            self.attn_std = (1 - momentum) * self.attn_std + momentum * batch_attn_std
+            self.spatial_mean = (1 - momentum) * self.spatial_mean + momentum * batch_spatial_mean
+            self.spatial_std = (1 - momentum) * self.spatial_std + momentum * batch_spatial_std
+            self.freq_mean = (1 - momentum) * self.freq_mean + momentum * batch_freq_mean
+            self.freq_std = (1 - momentum) * self.freq_std + momentum * batch_freq_std
+            self._stats_count += 1
+            
+            # Use current batch statistics for standardization during training
+            attn_mean_use = batch_attn_mean
+            attn_std_use = torch.clamp(batch_attn_std, min=1e-6)
+            spatial_mean_use = batch_spatial_mean
+            spatial_std_use = torch.clamp(batch_spatial_std, min=1e-6)
+            freq_mean_use = batch_freq_mean
+            freq_std_use = torch.clamp(batch_freq_std, min=1e-6)
+        else:
+            # Use fixed running statistics during evaluation (preserves absolute scale)
+            attn_mean_use = self.attn_mean
+            attn_std_use = torch.clamp(self.attn_std, min=1e-6)
+            spatial_mean_use = self.spatial_mean
+            spatial_std_use = torch.clamp(self.spatial_std, min=1e-6)
+            freq_mean_use = self.freq_mean
+            freq_std_use = torch.clamp(self.freq_std, min=1e-6)
+        
+        # Standardize using fixed statistics
+        attn_std = (attn_importance_norm - attn_mean_use) / attn_std_use
+        spatial_std = (spatial_energy - spatial_mean_use) / spatial_std_use
+        freq_std = (freq_energy - freq_mean_use) / freq_std_use
+        
+        # Replace any NaN or Inf with zeros (safety check)
+        attn_std = torch.where(torch.isfinite(attn_std), attn_std, torch.zeros_like(attn_std))
+        spatial_std = torch.where(torch.isfinite(spatial_std), spatial_std, torch.zeros_like(spatial_std))
+        freq_std = torch.where(torch.isfinite(freq_std), freq_std, torch.zeros_like(freq_std))
+        
+        # DEBUG: Log standardized values and running statistics
+        mode_str = "TRAINING (updating stats)" if self.training else "EVAL (using fixed stats)"
+        _debug_logger.debug(f"[SPADE DEBUG] Standardized values ({mode_str}) - "
+              f"attn: mean={attn_std.mean().item():.4f}, std={attn_std.std().item():.4f} "
+              f"(running: μ={self.attn_mean.item():.4f}, σ={self.attn_std.item():.4f}), "
+              f"spatial: mean={spatial_std.mean().item():.4f}, std={spatial_std.std().item():.4f} "
+              f"(running: μ={self.spatial_mean.item():.4f}, σ={self.spatial_std.item():.4f}), "
+              f"freq: mean={freq_std.mean().item():.4f}, std={freq_std.std().item():.4f} "
+              f"(running: μ={self.freq_mean.item():.4f}, σ={self.freq_std.item():.4f})")
+        
+        # 🔥 Step 3: Combine with learnable weights (all modalities now in same scale)
+        # No cross-term needed after standardization - all are already in comparable ranges
         patch_scores = (
-            self.score_alpha * attn_importance_norm +
-            self.score_beta * final_spatial_mahal +
-            self.score_gamma * final_freq_mahal +
-            self.score_lambda * (attn_importance_norm * final_spatial_mahal)
+            self.score_alpha * attn_std +
+            self.score_beta * spatial_std +
+            self.score_gamma * freq_std
         )  # (B, N)
+        
+        # Safety check: Replace any NaN or Inf with zeros
+        patch_scores = torch.where(torch.isfinite(patch_scores), patch_scores, torch.zeros_like(patch_scores))
+        
+        # DEBUG: Log learnable weights
+        _debug_logger.debug(f"[SPADE DEBUG] Learnable weights - alpha={self.score_alpha.item():.4f}, "
+              f"beta={self.score_beta.item():.4f}, gamma={self.score_gamma.item():.4f}")
         
         # DEBUG: Final patch scores statistics
         patch_mean = patch_scores.mean().item()
@@ -378,18 +516,47 @@ class SPADE(nn.Module):
         if patch_scores.shape[0] >= 1:
             first_5_scores = patch_scores[0, :5].cpu().tolist()
             _debug_logger.debug(f"[SPADE DEBUG] First 5 patch scores: {[f'{s:.6f}' for s in first_5_scores]}")
-            # Also log attention and mahal components for first patch (using RAW Mahalanobis)
-            first_attn = attn_importance_norm[0, 0].item()
-            first_mahal_raw = final_spatial_mahal[0, 0].item()
-            first_freq_raw = final_freq_mahal[0, 0].item() if freq_scores is not None else 0.0
-            first_cross = (attn_importance_norm * final_spatial_mahal)[0, 0].item()
+            # Also log attention and mahal components for first patch (standardized values)
+            first_attn_std = attn_std[0, 0].item()
+            first_spatial_std = spatial_std[0, 0].item()
+            first_freq_std = freq_std[0, 0].item() if freq_scores is not None else 0.0
             first_score = patch_scores[0, 0].item()
+            
+            # Log raw values for reference
+            first_attn_raw = attn_importance_norm[0, 0].item()
+            first_spatial_raw = final_spatial_mahal[0, 0].item()
+            first_freq_raw = final_freq_mahal[0, 0].item() if freq_scores is not None else 0.0
+            first_spatial_energy = spatial_energy[0, 0].item()
+            
             _debug_logger.debug(f"[SPADE DEBUG] First patch breakdown - "
-                  f"attn_contrib={self.score_alpha * first_attn:.6f} (alpha={self.score_alpha} * {first_attn:.6f}), "
-                  f"mahal_contrib={self.score_beta * first_mahal_raw:.6f} (beta={self.score_beta} * RAW={first_mahal_raw:.2f}), "
-                  f"freq_contrib={self.score_gamma * first_freq_raw:.6f} (gamma={self.score_gamma} * RAW={first_freq_raw:.2f}), "
-                  f"cross_contrib={self.score_lambda * first_cross:.6f} (lambda={self.score_lambda} * {first_cross:.6f}), "
+                  f"attn_contrib={self.score_alpha.item() * first_attn_std:.6f} "
+                  f"(alpha={self.score_alpha.item():.4f} * std={first_attn_std:.4f}, raw={first_attn_raw:.2f}), "
+                  f"spatial_contrib={self.score_beta.item() * first_spatial_std:.6f} "
+                  f"(beta={self.score_beta.item():.4f} * std={first_spatial_std:.4f}, energy={first_spatial_energy:.2f}, raw={first_spatial_raw:.2f}), "
+                  f"freq_contrib={self.score_gamma.item() * first_freq_std:.6f} "
+                  f"(gamma={self.score_gamma.item():.4f} * std={first_freq_std:.4f}, raw={first_freq_raw:.2f}), "
                   f"TOTAL={first_score:.6f}")
+        
+        # ═══════════════════════════════════════════════════════════════════
+        # ATTENTION VERIFICATION (only if enabled and we have both normal and anomalous patches)
+        # Run only once per epoch to avoid too many files
+        # ═══════════════════════════════════════════════════════════════════
+        if (self.verify_attention and raw_attention_scores is not None and patch_labels is not None 
+            and not self._verification_run_this_epoch):
+            # Only verify if we have both normal and anomalous patches
+            has_normal = (patch_labels == 0).any()
+            has_anomaly = (patch_labels == 1).any()
+            if has_normal and has_anomaly:
+                self._verify_attention_assumption(
+                    raw_attention_scores=raw_attention_scores,
+                    patch_labels=patch_labels,
+                    final_spatial_mahal=final_spatial_mahal,
+                    images=images,
+                )
+                self._verification_run_this_epoch = True  # Mark as run for this epoch
+            elif self.training:
+                # During training (normal-only), just log that we can't verify
+                _debug_logger.debug("[ATTENTION VERIFY] Skipping verification - training data has only normal patches")
         
         # DEBUG: Save query statistics for comparison (optional)
         if hasattr(self, '_debug_save_stats') and self._debug_save_stats:
@@ -479,6 +646,228 @@ class SPADE(nn.Module):
         
         return image_scores
     
+    @torch.no_grad()
+    def compute_statistics_once(self, device: torch.device = None):
+        """Compute Mahalanobis statistics once from all collected normal patches.
+        
+        This should be called after collecting all normal patches (e.g., after first epoch).
+        Computes statistics for both spatial and frequency features if enabled.
+        
+        Args:
+            device: Device to move patches to. If None, uses the device of the first parameter.
+        """
+        if not self.use_mahalanobis:
+            return
+        
+        # Compute spatial statistics
+        mu, sigma = self.normal_stats_tracker.compute_statistics_once()
+        if mu is not None:
+            normal_patches = torch.stack(list(self.normal_stats_tracker.normal_patch_buffer))
+            if device is not None:
+                normal_patches = normal_patches.to(device)
+            else:
+                # Use device of first model parameter
+                device = next(self.parameters()).device
+                normal_patches = normal_patches.to(device)
+            
+            self.mahalanobis_scorer.update_statistics(normal_patches)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # Compute frequency statistics if enabled
+        if self.use_frequency and self.freq_normal_stats_tracker is not None:
+            freq_mu, freq_sigma = self.freq_normal_stats_tracker.compute_statistics_once()
+            if freq_mu is not None:
+                normal_freq = torch.stack(list(self.freq_normal_stats_tracker.normal_patch_buffer))
+                if device is None:
+                    # Use device of first model parameter (already set above)
+                    device = next(self.parameters()).device
+                normal_freq = normal_freq.to(device)
+                
+                self.freq_mahalanobis_scorer.update_statistics(normal_freq)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    
+    def _verify_attention_assumption(
+        self,
+        raw_attention_scores: torch.Tensor,
+        patch_labels: torch.Tensor,
+        final_spatial_mahal: torch.Tensor,
+        images: torch.Tensor,
+    ) -> None:
+        """Verify the assumption: positive attention = normal, negative attention = anomalous.
+        
+        Logs statistics and saves visualizations to verify if:
+        - Normal patches have positive attention (on average)
+        - Anomalous patches have negative attention (on average)
+        - Attention correlates with Mahalanobis scores
+        
+        Args:
+            raw_attention_scores: (B, N) raw attention scores (before softmax, summed across queries).
+            patch_labels: (B, N) binary patch labels (0=normal, 1=anomalous).
+            final_spatial_mahal: (B, N) Mahalanobis scores.
+            images: (B, 3, H, W) original images for visualization.
+        """
+        import os
+        from datetime import datetime
+        import numpy as np
+        
+        # Create verification directory
+        verify_dir = "attention_verification"
+        os.makedirs(verify_dir, exist_ok=True)
+        
+        B, N = raw_attention_scores.shape
+        
+        # Flatten for analysis
+        raw_attn_flat = raw_attention_scores.detach().cpu().flatten()  # (B*N,)
+        labels_flat = patch_labels.detach().cpu().flatten()  # (B*N,)
+        mahal_flat = final_spatial_mahal.detach().cpu().flatten()  # (B*N,)
+        
+        # Separate normal and anomalous patches
+        normal_mask = labels_flat == 0
+        anomaly_mask = labels_flat == 1
+        
+        if normal_mask.sum() > 0 and anomaly_mask.sum() > 0:
+            # Statistics
+            normal_attn_mean = raw_attn_flat[normal_mask].mean().item()
+            normal_attn_std = raw_attn_flat[normal_mask].std().item()
+            normal_attn_min = raw_attn_flat[normal_mask].min().item()
+            normal_attn_max = raw_attn_flat[normal_mask].max().item()
+            
+            anomaly_attn_mean = raw_attn_flat[anomaly_mask].mean().item()
+            anomaly_attn_std = raw_attn_flat[anomaly_mask].std().item()
+            anomaly_attn_min = raw_attn_flat[anomaly_mask].min().item()
+            anomaly_attn_max = raw_attn_flat[anomaly_mask].max().item()
+            
+            # Correlation with Mahalanobis
+            # If assumption is correct: negative correlation (positive attention → low Mahalanobis)
+            correlation = torch.corrcoef(torch.stack([raw_attn_flat, mahal_flat]))[0, 1].item()
+            
+            # Log results
+            _debug_logger.info("=" * 80)
+            _debug_logger.info("🔍 ATTENTION VERIFICATION RESULTS")
+            _debug_logger.info("=" * 80)
+            _debug_logger.info(f"Normal patches (N={normal_mask.sum().item()}):")
+            _debug_logger.info(f"  Mean attention: {normal_attn_mean:.4f} (std={normal_attn_std:.4f})")
+            _debug_logger.info(f"  Range: [{normal_attn_min:.4f}, {normal_attn_max:.4f}]")
+            _debug_logger.info(f"Anomalous patches (N={anomaly_mask.sum().item()}):")
+            _debug_logger.info(f"  Mean attention: {anomaly_attn_mean:.4f} (std={anomaly_attn_std:.4f})")
+            _debug_logger.info(f"  Range: [{anomaly_attn_min:.4f}, {anomaly_attn_max:.4f}]")
+            _debug_logger.info(f"Attention-Mahalanobis correlation: {correlation:.4f}")
+            _debug_logger.info("")
+            
+            # Interpretation
+            if normal_attn_mean > 0 and anomaly_attn_mean < 0:
+                _debug_logger.info("✅ ASSUMPTION CONFIRMED: Positive attention = normal, Negative = anomalous")
+                _debug_logger.info("   → Use: attention_anomaly = -raw_attention (flip sign)")
+            elif normal_attn_mean < 0 and anomaly_attn_mean > 0:
+                _debug_logger.info("⚠️  ASSUMPTION REVERSED: Positive attention = anomalous, Negative = normal")
+                _debug_logger.info("   → Use: attention_anomaly = raw_attention (no flip)")
+            else:
+                _debug_logger.info("❓ ASSUMPTION UNCLEAR: Attention may not correlate with normality")
+                _debug_logger.info("   → Consider using absolute value or reducing attention weight")
+            
+            if correlation < -0.3:
+                _debug_logger.info(f"✅ Strong negative correlation ({correlation:.4f}) supports assumption")
+            elif correlation > 0.3:
+                _debug_logger.info(f"⚠️  Positive correlation ({correlation:.4f}) contradicts assumption")
+            else:
+                _debug_logger.info(f"❓ Weak correlation ({correlation:.4f}) - attention may be unreliable")
+            
+            _debug_logger.info("=" * 80)
+            
+            # Save statistics to file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stats_file = os.path.join(verify_dir, f"attention_stats_{timestamp}.txt")
+            with open(stats_file, "w") as f:
+                f.write("ATTENTION VERIFICATION STATISTICS\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"Normal patches (N={normal_mask.sum().item()}):\n")
+                f.write(f"  Mean: {normal_attn_mean:.4f}\n")
+                f.write(f"  Std: {normal_attn_std:.4f}\n")
+                f.write(f"  Min: {normal_attn_min:.4f}\n")
+                f.write(f"  Max: {normal_attn_max:.4f}\n\n")
+                f.write(f"Anomalous patches (N={anomaly_mask.sum().item()}):\n")
+                f.write(f"  Mean: {anomaly_attn_mean:.4f}\n")
+                f.write(f"  Std: {anomaly_attn_std:.4f}\n")
+                f.write(f"  Min: {anomaly_attn_min:.4f}\n")
+                f.write(f"  Max: {anomaly_attn_max:.4f}\n\n")
+                f.write(f"Attention-Mahalanobis correlation: {correlation:.4f}\n")
+            
+            # Visualize attention maps for first few images
+            self._visualize_attention_maps(
+                raw_attention_scores=raw_attention_scores,
+                patch_labels=patch_labels,
+                images=images,
+                save_dir=verify_dir,
+                timestamp=timestamp,
+            )
+    
+    def _visualize_attention_maps(
+        self,
+        raw_attention_scores: torch.Tensor,
+        patch_labels: torch.Tensor,
+        images: torch.Tensor,
+        save_dir: str,
+        timestamp: str,
+    ) -> None:
+        """Visualize attention maps for normal and anomalous patches.
+        
+        Args:
+            raw_attention_scores: (B, N) raw attention scores.
+            patch_labels: (B, N) binary patch labels.
+            images: (B, 3, H, W) original images.
+            save_dir: Directory to save visualizations.
+            timestamp: Timestamp string for file naming.
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from utils.heatmap import patches_to_heatmap, overlay_heatmap
+        
+        # Visualize first 4 images
+        num_viz = min(4, images.shape[0])
+        
+        fig, axes = plt.subplots(num_viz, 3, figsize=(15, 5 * num_viz))
+        if num_viz == 1:
+            axes = axes.reshape(1, -1)
+        
+        for i in range(num_viz):
+            # Original image
+            img = images[i].permute(1, 2, 0).cpu().numpy()
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)  # Normalize to [0, 1]
+            img = (img * 255).astype(np.uint8)
+            
+            # Raw attention heatmap
+            raw_attn = raw_attention_scores[i].detach().cpu()  # (N,)
+            attn_heatmap = patches_to_heatmap(raw_attn, normalize=True)
+            attn_overlay = overlay_heatmap(img.copy(), attn_heatmap, alpha=0.5)
+            
+            # Patch labels heatmap
+            labels = patch_labels[i].detach().cpu().float()  # (N,)
+            label_heatmap = patches_to_heatmap(labels, normalize=False)
+            label_overlay = overlay_heatmap(img.copy(), label_heatmap, alpha=0.5, colormap_name="RdYlGn")
+            
+            # Plot
+            axes[i, 0].imshow(img)
+            axes[i, 0].set_title(f"Image {i+1}")
+            axes[i, 0].axis("off")
+            
+            axes[i, 1].imshow(attn_overlay)
+            axes[i, 1].set_title(f"Raw Attention (mean={raw_attn.mean().item():.4f})")
+            axes[i, 1].axis("off")
+            
+            axes[i, 2].imshow(label_overlay)
+            axes[i, 2].set_title(f"Ground Truth (anomaly={labels.sum().item()}/{len(labels)} patches)")
+            axes[i, 2].axis("off")
+        
+        plt.tight_layout()
+        import os
+        viz_file = os.path.join(save_dir, f"attention_visualization_{timestamp}.png")
+        plt.savefig(viz_file, dpi=150, bbox_inches="tight")
+        plt.close()
+        
+        _debug_logger.info(f"💾 Saved attention visualization to: {viz_file}")
+    
     def enable_frequency_features(
         self,
         freq_num_bands: int = 6,
@@ -497,7 +886,9 @@ class SPADE(nn.Module):
         from models.frequency_features import FourierPatchFeatureExtractor
         
         self.use_frequency = True
-        self.score_gamma = score_gamma
+        # Update learnable parameter (don't replace it)
+        with torch.no_grad():
+            self.score_gamma.data.fill_(score_gamma)
         
         self.freq_extractor = FourierPatchFeatureExtractor(
             num_freq_bands=freq_num_bands,
@@ -515,6 +906,4 @@ class SPADE(nn.Module):
         # Frequency statistics tracker
         self.freq_normal_stats_tracker = NormalStatisticsTracker(
             feature_dim=freq_feature_dim,
-            buffer_size=self.normal_stats_tracker.buffer_size,
-            update_frequency=self.normal_stats_tracker.update_frequency,
         )

@@ -154,18 +154,26 @@ def validate(
 ) -> dict[str, float]:
     """Validation on real MVTec test split (image AUROC + patch AUROC)."""
     model.eval()
+    # Reset verification flag for this validation run
+    if hasattr(model, '_verification_run_this_epoch'):
+        model._verification_run_this_epoch = False
 
     all_image_labels: list[int] = []
     all_image_scores: list[float] = []
     all_patch_labels: list[np.ndarray] = []
     all_patch_scores: list[np.ndarray] = []
 
-    for batch in tqdm(loader, desc="Validating", leave=False):
+    for batch_idx, batch in enumerate(tqdm(loader, desc="Validating", leave=False)):
         images = batch["image"].to(device)
         labels = batch["label"].cpu().numpy().astype(np.int64)  # (B,)
         patch_labels = batch["patch_labels"].cpu().numpy().astype(np.float32)  # (B, N)
+        patch_labels_tensor = torch.from_numpy(patch_labels).to(device)  # For verification
 
-        outputs = model(images)  # No update_stats in validation
+        # Pass patch_labels for attention verification (only on first batch to avoid too many files)
+        if batch_idx == 0 and model.verify_attention:
+            outputs = model(images, patch_labels=patch_labels_tensor, update_stats=False)
+        else:
+            outputs = model(images)  # No update_stats in validation
         # Normalize patch_scores for evaluation
         patch_scores = outputs["patch_scores"]
         normalized_scores = torch.sigmoid(torch.log1p(patch_scores))
@@ -183,6 +191,14 @@ def validate(
     s_img = np.array(all_image_scores)
     y_patch = np.concatenate(all_patch_labels, axis=0)
     s_patch = np.concatenate(all_patch_scores, axis=0)
+
+    # Check for NaN/Inf values and replace them
+    if np.any(~np.isfinite(s_img)):
+        print(f"WARNING: Found {np.sum(~np.isfinite(s_img))} non-finite image scores, replacing with 0")
+        s_img = np.where(np.isfinite(s_img), s_img, 0.0)
+    if np.any(~np.isfinite(s_patch)):
+        print(f"WARNING: Found {np.sum(~np.isfinite(s_patch))} non-finite patch scores, replacing with 0")
+        s_patch = np.where(np.isfinite(s_patch), s_patch, 0.0)
 
     # AUROC requires both classes present
     metrics: dict[str, float] = {}
@@ -364,12 +380,18 @@ def main() -> None:
         # Scoring parameters
         score_alpha=cfg["scoring"]["alpha"],
         score_beta=cfg["scoring"]["beta"],
+        score_gamma=cfg["scoring"].get("gamma", 0.25),  # Frequency weight
         score_lambda=cfg["scoring"]["lambda"],
         mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
         mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
+        use_mahalanobis=cfg["scoring"].get("use_mahalanobis", True),
         # Normal statistics parameters
         normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
+        # Attention verification
+        verify_attention=cfg["scoring"].get("verify_attention", False),
+        # Raw attention mode
+        use_raw_attention=cfg["scoring"].get("use_raw_attention", True),
     ).to(device)
 
     # Enable/disable HPA based on config
@@ -378,6 +400,12 @@ def main() -> None:
     # ⚠️ CRITICAL: Force set and verify
     model.use_hpa = use_hpa
     logger.info(f"🔧 SET model.use_hpa = {use_hpa} (type: {type(use_hpa)})")
+    
+    # Log Mahalanobis status
+    if model.use_mahalanobis:
+        logger.info("✅ Mahalanobis scoring enabled")
+    else:
+        logger.info("❌ Mahalanobis scoring DISABLED - using only attention scores")
     
     # ⚠️ CRITICAL: Verify it's actually set correctly
     if model.use_hpa != use_hpa:
@@ -490,6 +518,16 @@ def main() -> None:
             f"loss: {metrics['total']:.4f} | "
             f"patch: {metrics['patch']:.4f}"
         )
+        
+        # Compute Mahalanobis statistics once after first epoch (using all collected normal patches)
+        if epoch == 1 and model.use_mahalanobis:
+            logger.info("Computing Mahalanobis statistics from all collected normal patches...")
+            model.compute_statistics_once(device=device)
+            num_spatial = len(model.normal_stats_tracker.normal_patch_buffer)
+            logger.info(f"✅ Computed spatial Mahalanobis statistics from {num_spatial} normal patches")
+            if model.use_frequency and model.freq_normal_stats_tracker is not None:
+                num_freq = len(model.freq_normal_stats_tracker.normal_patch_buffer)
+                logger.info(f"✅ Computed frequency Mahalanobis statistics from {num_freq} normal patches")
 
         # ── Validation (real test anomalies or synthetic) ──
         if val_loader is not None:
@@ -516,34 +554,67 @@ def main() -> None:
             wandb.log(log_dict, step=epoch * len(loader))
 
         # ── Early Stopping Check ──
-        # Use combined metric (average of image and patch AUROC) for early stopping
+        # Trigger when BOTH metrics don't improve (both <= previous best) for N epochs
         if early_stopper is not None and val_loader is not None:
             current_image = val_metrics["val/image_auroc"]
             current_patch = val_metrics["val/patch_auroc"]
-            # Use average of both metrics, or image AUROC if patch is NaN
-            if not np.isnan(current_image) and not np.isnan(current_patch):
-                current_score = (current_image + current_patch) / 2.0
-            elif not np.isnan(current_image):
-                current_score = current_image
-            else:
-                current_score = float("nan")
             
-            if not np.isnan(current_score):
-                if early_stopper(current_score):
-                    logger.info(
-                        f"Early stopping triggered at epoch {epoch} "
-                        f"(combined score: {current_score:.4f} = "
-                        f"image:{current_image:.4f} + patch:{current_patch:.4f} / 2)"
-                    )
-                    if use_wandb:
-                        wandb.log({"early_stopping/triggered": True, "early_stopping/epoch": epoch})
-                    break
+            image_valid = not np.isnan(current_image)
+            patch_valid = not np.isnan(current_patch)
+            
+            if image_valid and patch_valid:
+                # Check if BOTH metrics improved (both > previous best)
+                image_improved = current_image > best_val_image_auroc
+                patch_improved = current_patch > best_val_patch_auroc
+                both_improved = image_improved and patch_improved
+                
+                # "Both don't improve" = both are <= previous best (same or degraded)
+                both_dont_improve = (current_image <= best_val_image_auroc) and (current_patch <= best_val_patch_auroc)
+                
+                if both_improved:
+                    # Both improved - reset counter
+                    early_stopper.counter = 0
+                    if early_stopper.verbose:
+                        logger.info(
+                            f"EarlyStopping: Both metrics improved "
+                            f"(image: {current_image:.4f} > {best_val_image_auroc:.4f}, "
+                            f"patch: {current_patch:.4f} > {best_val_patch_auroc:.4f})"
+                        )
+                elif both_dont_improve:
+                    # Both didn't improve (both <= previous best) - increment counter
+                    early_stopper.counter += 1
+                    if early_stopper.verbose:
+                        logger.info(
+                            f"EarlyStopping: Both metrics did not improve "
+                            f"(image: {current_image:.4f} <= {best_val_image_auroc:.4f}, "
+                            f"patch: {current_patch:.4f} <= {best_val_patch_auroc:.4f}) - "
+                            f"patience: {early_stopper.counter}/{early_stopper.patience}"
+                        )
+                    
+                    if early_stopper.counter >= early_stopper.patience:
+                        early_stopper.early_stop = True
+                        if early_stopper.verbose:
+                            logger.info(
+                                f"Early stopping triggered at epoch {epoch} "
+                                f"after {early_stopper.patience} epochs without both metrics improving"
+                            )
+                        if use_wandb:
+                            wandb.log({"early_stopping/triggered": True, "early_stopping/epoch": epoch})
+                        break
+                else:
+                    # Mixed: one improved, one didn't - reset counter (not "both don't improve")
+                    early_stopper.counter = 0
+                    if early_stopper.verbose:
+                        logger.info(
+                            f"EarlyStopping: Mixed results "
+                            f"(image: {current_image:.4f} vs {best_val_image_auroc:.4f}, "
+                            f"patch: {current_patch:.4f} vs {best_val_patch_auroc:.4f}) - "
+                            f"counter reset"
+                        )
 
         # ── Checkpoint Saving Logic ──
-        # Save checkpoint when:
-        # 1. BOTH metrics improve, OR
-        # 2. One improves and the other stays constant, OR
-        # 3. One improves and the other degrades only slightly (within tolerance)
+        # Save when: both improve OR (one improves AND other degrades slightly within tolerance)
+        # Do NOT save when both don't improve
         current_image = val_metrics["val/image_auroc"]
         current_patch = val_metrics["val/patch_auroc"]
         
@@ -559,8 +630,6 @@ def main() -> None:
                 patch_improved = current_patch > best_val_patch_auroc
                 image_degraded = current_image < best_val_image_auroc
                 patch_degraded = current_patch < best_val_patch_auroc
-                image_unchanged = current_image == best_val_image_auroc
-                patch_unchanged = current_patch == best_val_patch_auroc
                 
                 # Check if degradation is within acceptable tolerance
                 image_degradation = best_val_image_auroc - current_image if image_degraded else 0.0
@@ -570,14 +639,11 @@ def main() -> None:
                 
                 # Save checkpoint if:
                 # 1. BOTH metrics improve, OR
-                # 2. One improves and the other stays constant, OR
-                # 3. One improves and the other degrades only slightly (within tolerance)
+                # 2. One improves and the other degrades only slightly (within tolerance)
                 should_save = (
                     (image_improved and patch_improved) or
-                    (image_improved and patch_unchanged) or
-                    (patch_improved and image_unchanged) or
-                    (image_improved and patch_degradation_acceptable) or
-                    (patch_improved and image_degradation_acceptable)
+                    (image_improved and patch_degraded and patch_degradation_acceptable) or
+                    (patch_improved and image_degraded and image_degradation_acceptable)
                 )
                 
                 if should_save:
@@ -587,7 +653,8 @@ def main() -> None:
 
                     trainable_state = {
                         k: v for k, v in model.state_dict().items()
-                        if any(k.startswith(prefix) for prefix in ["qformer.", "projection.", "hpa.", "query_patch_attn.", "mahalanobis_scorer.", "normal_stats_tracker."])
+                        if any(k.startswith(prefix) for prefix in ["qformer.", "projection.", "hpa.", "query_patch_attn.", "mahalanobis_scorer.", "freq_mahalanobis_scorer.", "normal_stats_tracker.", "freq_normal_stats_tracker.", "score_alpha", "score_beta", "score_gamma", "score_lambda"])
+                        or k in ["attn_mean", "attn_std", "spatial_mean", "spatial_std", "freq_mean", "freq_std", "_stats_count"]  # Running statistics buffers
                     }
 
                     best_path = os.path.join(checkpoint_dir, "spade_best.pt")

@@ -2,30 +2,27 @@
 
 import torch
 import torch.nn as nn
-from collections import deque
 
 
 class NormalStatisticsTracker(nn.Module):
     """Tracks normal patch embeddings for statistical modeling.
     
-    Maintains a buffer of normal patch embeddings and updates
-    μ and Σ periodically.
+    Collects ALL normal patches during training (no buffer limit).
+    Statistics are computed once from all collected patches.
     """
     
     def __init__(
         self,
         feature_dim: int,
-        buffer_size: int = 10000,
-        update_frequency: int = 100,
+        buffer_size: int = None,  # Deprecated, kept for backward compatibility
+        update_frequency: int = None,  # Deprecated, kept for backward compatibility
     ):
         super().__init__()
         self.feature_dim = feature_dim
-        self.buffer_size = buffer_size
-        self.update_frequency = update_frequency
         
-        # Buffer for normal patches
-        self.normal_patch_buffer = deque(maxlen=buffer_size)
-        self.step_count = 0
+        # Buffer for normal patches - use list to store ALL patches (no limit)
+        self.normal_patch_buffer = []
+        self.statistics_computed = False
         
     def add_normal_patches(
         self,
@@ -38,6 +35,10 @@ class NormalStatisticsTracker(nn.Module):
             patch_embeds: (B, N, D) patch embeddings.
             patch_labels: (B, N) binary patch labels (0=normal, 1=anomaly).
         """
+        if self.statistics_computed:
+            # Statistics already computed, don't add more patches
+            return
+        
         # Extract normal patches (label == 0)
         normal_mask = (patch_labels == 0)  # (B, N)
         normal_patches = patch_embeds[normal_mask]  # (N_normal, D)
@@ -67,5 +68,15 @@ class NormalStatisticsTracker(nn.Module):
         centered = normal_patches - mu.unsqueeze(0)
         sigma = (centered.T @ centered) / max(normal_patches.shape[0] - 1, 1)  # (D, D)
         
+        return mu, sigma
+    
+    def compute_statistics_once(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Compute statistics once from all collected patches and mark as computed.
+        
+        Returns:
+            (mu, sigma) tensors of shape (D,) and (D, D), or (None, None) if buffer empty.
+        """
+        mu, sigma = self.get_statistics()
+        self.statistics_computed = True
         return mu, sigma
 
