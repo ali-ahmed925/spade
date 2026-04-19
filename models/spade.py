@@ -56,6 +56,10 @@ class SPADE(nn.Module):
         verify_attention: bool = False,  # Enable attention verification (logs and visualizes)
         # Raw attention mode
         use_raw_attention: bool = True,  # Use raw attention scores (larger scale, handles negatives)
+        # Image-level score from patch scores (see get_image_score)
+        image_score_mode: str = "quantile",
+        image_score_quantile: float = 0.99,
+        image_score_top_k: int = 3,
     ):
         super().__init__()
         
@@ -136,6 +140,10 @@ class SPADE(nn.Module):
         
         # Raw attention mode: use raw scores instead of softmax probabilities
         self.use_raw_attention = use_raw_attention  # Enable raw attention scores (larger scale, handles negatives)
+        
+        self.image_score_mode = image_score_mode
+        self.image_score_quantile = image_score_quantile
+        self.image_score_top_k = image_score_top_k
         
         if self.use_raw_attention:
             _debug_logger.info(f"✅ Raw attention mode ENABLED - using raw scores (before softmax) with ReLU+shift for negatives")
@@ -623,7 +631,12 @@ class SPADE(nn.Module):
         }
     
     def get_image_score(self, patch_scores: torch.Tensor) -> torch.Tensor:
-        """Aggregate patch scores into image-level score using top-3 mean.
+        """Aggregate patch scores into one score per image.
+        
+        Modes (``self.image_score_mode``):
+          - ``quantile``: per-image ``q``-th quantile over all patches (default q=0.99).
+          - ``max``: maximum patch score per image.
+          - ``topk_mean``: mean of the top-``k`` patch scores (legacy behavior).
         
         Args:
             patch_scores: (B, N) patch anomaly scores.
@@ -631,18 +644,40 @@ class SPADE(nn.Module):
         Returns:
             (B,) image-level anomaly scores.
         """
-        # Get top-3 patch scores per image
-        top3_scores, top3_indices = torch.topk(patch_scores, k=min(3, patch_scores.shape[1]), dim=1)
-        image_scores = top3_scores.mean(dim=1)  # (B,)
-        
-        # DEBUG: Log top-3 patch indices and scores
         from utils.debug_logger import get_debug_logger
-        _debug_logger = get_debug_logger("spade_debug")
-        if patch_scores.shape[0] == 1:  # Only log for single image batches to avoid spam
-            top3_vals = top3_scores[0].cpu().tolist()
-            top3_idx = top3_indices[0].cpu().tolist()
-            _debug_logger.debug(f"[SPADE DEBUG] Image score: {image_scores[0].item():.4f}, "
-                  f"top3_indices: {top3_idx}, top3_scores: {[f'{v:.4f}' for v in top3_vals]}")
+        _dbg = get_debug_logger("spade_debug")
+        _, n = patch_scores.shape
+        mode = (self.image_score_mode or "quantile").lower()
+        
+        if mode == "quantile":
+            q = float(self.image_score_quantile)
+            q = max(0.0, min(1.0, q))
+            image_scores = torch.quantile(patch_scores, q, dim=1)
+            if patch_scores.shape[0] == 1:
+                _dbg.debug(
+                    f"[SPADE DEBUG] Image score (quantile q={q}): {image_scores[0].item():.4f}"
+                )
+        elif mode == "max":
+            image_scores = patch_scores.max(dim=1).values
+            if patch_scores.shape[0] == 1:
+                _dbg.debug(f"[SPADE DEBUG] Image score (max): {image_scores[0].item():.4f}")
+        elif mode in ("topk_mean", "top_k_mean"):
+            k = min(int(self.image_score_top_k), n)
+            k = max(1, k)
+            topk_scores, topk_indices = torch.topk(patch_scores, k=k, dim=1)
+            image_scores = topk_scores.mean(dim=1)
+            if patch_scores.shape[0] == 1:
+                topk_vals = topk_scores[0].cpu().tolist()
+                topk_idx = topk_indices[0].cpu().tolist()
+                _dbg.debug(
+                    f"[SPADE DEBUG] Image score (top-{k} mean): {image_scores[0].item():.4f}, "
+                    f"indices: {topk_idx}, scores: {[f'{v:.4f}' for v in topk_vals]}"
+                )
+        else:
+            raise ValueError(
+                f"Unknown image_score_mode={self.image_score_mode!r}; "
+                "use 'quantile', 'max', or 'topk_mean'."
+            )
         
         return image_scores
     

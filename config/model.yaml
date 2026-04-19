@@ -29,6 +29,11 @@ scoring:
   mahalanobis_reg: 1e-4                   # Covariance regularization (increased for stability)
   verify_attention: false                 # Enable attention verification (logs and visualizes attention on normal vs anomalous patches)
   use_raw_attention: true                 # Use raw attention scores instead of softmax probabilities (larger scale, better match with Mahalanobis)
+  # Image-level score from patch scores (AUROC / inference)
+  image_score:
+    mode: quantile                        # quantile | max | topk_mean
+    quantile: 0.99                      # per-image quantile over all patches (mode=quantile)
+    top_k: 3                             # mean of top-k patches (mode=topk_mean)
 
 # ── Frequency Features (NEW) ──
 frequency:

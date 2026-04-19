@@ -392,6 +392,10 @@ def main() -> None:
         verify_attention=cfg["scoring"].get("verify_attention", False),
         # Raw attention mode
         use_raw_attention=cfg["scoring"].get("use_raw_attention", True),
+        # Image-level aggregation (quantile / max / topk_mean)
+        image_score_mode=(cfg["scoring"].get("image_score") or {}).get("mode", "quantile"),
+        image_score_quantile=float((cfg["scoring"].get("image_score") or {}).get("quantile", 0.99)),
+        image_score_top_k=int((cfg["scoring"].get("image_score") or {}).get("top_k", 3)),
     ).to(device)
 
     # Enable/disable HPA based on config
@@ -406,6 +410,10 @@ def main() -> None:
         logger.info("✅ Mahalanobis scoring enabled")
     else:
         logger.info("❌ Mahalanobis scoring DISABLED - using only attention scores")
+    logger.info(
+        f"Image-level score: mode={model.image_score_mode}, "
+        f"quantile={model.image_score_quantile}, top_k={model.image_score_top_k}"
+    )
     
     # ⚠️ CRITICAL: Verify it's actually set correctly
     if model.use_hpa != use_hpa:
