@@ -12,7 +12,7 @@ training:
   checkpoint_dir: "./checkpoints"
   early_stopping:
     enabled: true
-    patience: 5                            # epochs to wait before stopping (when both metrics don't improve)
+    patience: 10                           # stop after this many epochs without image AUROC improvement (see min_delta)
     mode: "max"                            # "max" for AUROC, "min" for loss
     min_delta: 0.001                      # minimum change to qualify as improvement
   checkpoint:

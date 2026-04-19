@@ -497,8 +497,9 @@ def main() -> None:
     best_val_patch_auroc = -float("inf")
     best_epoch = -1
     
-    # ── Early Stopping ──
+    # ── Early Stopping (patience counts epochs without image AUROC improvement) ──
     early_stop_cfg = tcfg.get("early_stopping", {})
+    improve_delta = float(early_stop_cfg.get("min_delta", 0.0))
     early_stopper = None
     if early_stop_cfg.get("enabled", False) and val_loader is not None:
         early_stopper = EarlyStopping(
@@ -507,7 +508,10 @@ def main() -> None:
             min_delta=early_stop_cfg.get("min_delta", 0.001),
             verbose=True,
         )
-        logger.info(f"Early stopping enabled: patience={early_stopper.patience}, mode={early_stopper.mode}")
+        logger.info(
+            f"Early stopping enabled: stop after {early_stopper.patience} epoch(s) without image AUROC "
+            f"improvement (> best + {improve_delta})"
+        )
 
     for epoch in range(1, tcfg["epochs"] + 1):
         metrics = train_one_epoch(
@@ -553,102 +557,24 @@ def main() -> None:
                 log_dict["epoch/loss_pseudo"] = metrics["pseudo"]
             wandb.log(log_dict, step=epoch * len(loader))
 
-        # ── Early Stopping Check ──
-        # Trigger when BOTH metrics don't improve (both <= previous best) for N epochs
-        if early_stopper is not None and val_loader is not None:
-            current_image = val_metrics["val/image_auroc"]
-            current_patch = val_metrics["val/patch_auroc"]
-            
-            image_valid = not np.isnan(current_image)
-            patch_valid = not np.isnan(current_patch)
-            
-            if image_valid and patch_valid:
-                # Check if BOTH metrics improved (both > previous best)
-                image_improved = current_image > best_val_image_auroc
-                patch_improved = current_patch > best_val_patch_auroc
-                both_improved = image_improved and patch_improved
-                
-                # "Both don't improve" = both are <= previous best (same or degraded)
-                both_dont_improve = (current_image <= best_val_image_auroc) and (current_patch <= best_val_patch_auroc)
-                
-                if both_improved:
-                    # Both improved - reset counter
-                    early_stopper.counter = 0
-                    if early_stopper.verbose:
-                        logger.info(
-                            f"EarlyStopping: Both metrics improved "
-                            f"(image: {current_image:.4f} > {best_val_image_auroc:.4f}, "
-                            f"patch: {current_patch:.4f} > {best_val_patch_auroc:.4f})"
-                        )
-                elif both_dont_improve:
-                    # Both didn't improve (both <= previous best) - increment counter
-                    early_stopper.counter += 1
-                    if early_stopper.verbose:
-                        logger.info(
-                            f"EarlyStopping: Both metrics did not improve "
-                            f"(image: {current_image:.4f} <= {best_val_image_auroc:.4f}, "
-                            f"patch: {current_patch:.4f} <= {best_val_patch_auroc:.4f}) - "
-                            f"patience: {early_stopper.counter}/{early_stopper.patience}"
-                        )
-                    
-                    if early_stopper.counter >= early_stopper.patience:
-                        early_stopper.early_stop = True
-                        if early_stopper.verbose:
-                            logger.info(
-                                f"Early stopping triggered at epoch {epoch} "
-                                f"after {early_stopper.patience} epochs without both metrics improving"
-                            )
-                        if use_wandb:
-                            wandb.log({"early_stopping/triggered": True, "early_stopping/epoch": epoch})
-                        break
-                else:
-                    # Mixed: one improved, one didn't - reset counter (not "both don't improve")
-                    early_stopper.counter = 0
-                    if early_stopper.verbose:
-                        logger.info(
-                            f"EarlyStopping: Mixed results "
-                            f"(image: {current_image:.4f} vs {best_val_image_auroc:.4f}, "
-                            f"patch: {current_patch:.4f} vs {best_val_patch_auroc:.4f}) - "
-                            f"counter reset"
-                        )
-
-        # ── Checkpoint Saving Logic ──
-        # Save when: both improve OR (one improves AND other degrades slightly within tolerance)
-        # Do NOT save when both don't improve
+        # ── Checkpoint saving & early stopping (image AUROC only) ──
+        # Save when image AUROC improves by more than min_delta; otherwise increment patience (1/epoch toward limit).
         current_image = val_metrics["val/image_auroc"]
         current_patch = val_metrics["val/patch_auroc"]
-        
-        # Get degradation tolerance from config (default 0.02 = 2% acceptable drop)
-        degradation_tolerance = tcfg.get("checkpoint", {}).get("degradation_tolerance", 0.02)
-        
+
         if val_loader is not None:
             image_valid = not np.isnan(current_image)
             patch_valid = not np.isnan(current_patch)
-            
-            if image_valid and patch_valid:
-                image_improved = current_image > best_val_image_auroc
-                patch_improved = current_patch > best_val_patch_auroc
-                image_degraded = current_image < best_val_image_auroc
-                patch_degraded = current_patch < best_val_patch_auroc
-                
-                # Check if degradation is within acceptable tolerance
-                image_degradation = best_val_image_auroc - current_image if image_degraded else 0.0
-                patch_degradation = best_val_patch_auroc - current_patch if patch_degraded else 0.0
-                image_degradation_acceptable = image_degradation <= degradation_tolerance
-                patch_degradation_acceptable = patch_degradation <= degradation_tolerance
-                
-                # Save checkpoint if:
-                # 1. BOTH metrics improve, OR
-                # 2. One improves and the other degrades only slightly (within tolerance)
-                should_save = (
-                    (image_improved and patch_improved) or
-                    (image_improved and patch_degraded and patch_degradation_acceptable) or
-                    (patch_improved and image_degraded and image_degradation_acceptable)
-                )
-                
-                if should_save:
+
+            if image_valid:
+                image_improved = current_image > best_val_image_auroc + improve_delta
+
+                if image_improved:
+                    if early_stopper is not None:
+                        early_stopper.counter = 0
                     best_val_image_auroc = current_image
-                    best_val_patch_auroc = current_patch
+                    if patch_valid:
+                        best_val_patch_auroc = current_patch
                     best_epoch = epoch
 
                     trainable_state = {
@@ -658,10 +584,12 @@ def main() -> None:
                     }
 
                     best_path = os.path.join(checkpoint_dir, "spade_best.pt")
+                    saved_patch = float(current_patch) if patch_valid else float("nan")
+                    patch_log = f"{saved_patch:.4f}" if patch_valid else "nan"
                     torch.save({
                         "epoch": epoch,
                         "val_image_auroc": float(best_val_image_auroc),
-                        "val_patch_auroc": float(best_val_patch_auroc),
+                        "val_patch_auroc": saved_patch,
                         "model_state_dict": trainable_state,
                         "optimizer_state_dict": optimizer.state_dict(),
                         "config": {
@@ -673,29 +601,37 @@ def main() -> None:
                         },
                     }, best_path)
                     logger.info(
-                        f"New best metrics @ epoch {epoch} → "
+                        f"New best image AUROC @ epoch {epoch} → "
                         f"image_auroc={best_val_image_auroc:.4f}, "
-                        f"patch_auroc={best_val_patch_auroc:.4f} → saved {best_path}"
+                        f"patch_auroc={patch_log} → saved {best_path}"
                     )
                     if use_wandb:
                         wandb.run.summary["best_val_image_auroc"] = float(best_val_image_auroc)
-                        wandb.run.summary["best_val_patch_auroc"] = float(best_val_patch_auroc)
+                        wandb.run.summary["best_val_patch_auroc"] = saved_patch
                         wandb.run.summary["best_epoch"] = int(best_epoch)
-                elif image_improved or patch_improved:
-                    # Log when only one metric improves but the other degrades beyond tolerance
-                    if image_improved and patch_degraded and not patch_degradation_acceptable:
+                else:
+                    if early_stopper is not None:
+                        early_stopper.counter += 1
+                        if early_stopper.verbose:
+                            thresh = best_val_image_auroc + improve_delta
+                            logger.info(
+                                f"EarlyStopping: no image AUROC improvement "
+                                f"({current_image:.4f} <= {thresh:.4f}) — "
+                                f"patience {early_stopper.counter}/{early_stopper.patience}"
+                            )
+                        if early_stopper.counter >= early_stopper.patience:
+                            early_stopper.early_stop = True
+                            logger.info(
+                                f"Early stopping triggered at epoch {epoch} "
+                                f"after {early_stopper.patience} epoch(s) without image AUROC improvement"
+                            )
+                            if use_wandb:
+                                wandb.log({"early_stopping/triggered": True, "early_stopping/epoch": epoch})
+                            break
+                    if patch_valid and current_patch > best_val_patch_auroc:
                         logger.info(
-                            f"Image AUROC improved ({current_image:.4f} > {best_val_image_auroc:.4f}), "
-                            f"but patch AUROC degraded too much ({current_patch:.4f} < {best_val_patch_auroc:.4f}, "
-                            f"degradation: {patch_degradation:.4f} > tolerance: {degradation_tolerance:.4f}) - "
-                            f"checkpoint not saved"
-                        )
-                    elif patch_improved and image_degraded and not image_degradation_acceptable:
-                        logger.info(
-                            f"Patch AUROC improved ({current_patch:.4f} > {best_val_patch_auroc:.4f}), "
-                            f"but image AUROC degraded too much ({current_image:.4f} < {best_val_image_auroc:.4f}, "
-                            f"degradation: {image_degradation:.4f} > tolerance: {degradation_tolerance:.4f}) - "
-                            f"checkpoint not saved"
+                            f"Patch AUROC improved ({current_patch:.4f} > {best_val_patch_auroc:.4f}) "
+                            f"but image AUROC did not — checkpoint not saved"
                         )
 
     if use_wandb:

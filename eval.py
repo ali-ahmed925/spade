@@ -277,6 +277,12 @@ def evaluate(
 def main() -> None:
     parser = argparse.ArgumentParser(description="SPADE Evaluation")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="MVTec category to evaluate (must match checkpoint). Overrides dataset.category in data.yaml.",
+    )
     parser.add_argument("--save_heatmaps", type=str, default=None, help="Dir to save heatmaps (raw heatmap PNGs)")
     parser.add_argument("--save_visualizations", action="store_true", help="Save full localization visualizations (image + GT + heatmap + overlay)")
     parser.add_argument("--log_wandb", action="store_true", help="Log results to wandb")
@@ -284,6 +290,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
+    if args.category is not None:
+        cfg["dataset"]["category"] = args.category
     logger = get_logger("eval")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
