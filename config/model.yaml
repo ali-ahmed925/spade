@@ -10,7 +10,7 @@ vit:
 
 # ── Hierarchical Patch Annealing (HPA) ──
 hpa:
-  enabled: false                            # Enable HPA (set to false to score all patches directly)
+  enabled: true                            # Enable HPA (set to false to score all patches directly)
   n_max: 256                              # Starting patches
   n_min: 32                               # Minimum patches at final step
   t_steps: 12                              # Total refinement steps (reduced for memory efficiency)

@@ -176,7 +176,7 @@ def validate(
             outputs = model(images)  # No update_stats in validation
         # Normalize patch_scores for evaluation
         patch_scores = outputs["patch_scores"]
-        normalized_scores = torch.sigmoid(torch.log1p(patch_scores))
+        normalized_scores = torch.sigmoid(patch_scores)
         patch_probs = normalized_scores.detach().cpu().numpy().astype(np.float32)  # (B, N)
         image_scores = model.get_image_score(patch_scores).detach().cpu().numpy().astype(np.float32)  # (B,)
 

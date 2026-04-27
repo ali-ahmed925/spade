@@ -76,6 +76,13 @@ class HybridPatchAnnealing(nn.Module):
         # NEW: Frequency scoring
         freq_scores: torch.Tensor | None = None,  # (B, N) - precomputed for ALL patches
         gamma: float = 0.25,  # Weight for frequency component
+        use_raw_attention: bool = True,
+        attn_mean: float = 0.0,
+        attn_std: float = 1.0,
+        spatial_mean: float = 0.0,
+        spatial_std: float = 1.0,
+        freq_mean: float = 0.0,
+        freq_std: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform hierarchical patch refinement with attention re-computation.
         
@@ -169,9 +176,18 @@ class HybridPatchAnnealing(nn.Module):
             current_query_tokens = refined_query_embeds  # ✅ Accumulate refinement
             
             # 2. Re-compute attention importance on current patches
-            _, attention_importance = query_patch_attn(
-                refined_query_embeds, current_patches
-            )  # (B, N_t)
+            if use_raw_attention:
+                _, attention_importance, raw_attention_scores = query_patch_attn(
+                    refined_query_embeds, current_patches, return_raw_scores=True
+                )
+                attention_anomaly = -raw_attention_scores
+                attention_min = attention_anomaly.min(dim=1, keepdim=True)[0]
+                attention_component = attention_anomaly - attention_min
+            else:
+                _, attention_importance = query_patch_attn(
+                    refined_query_embeds, current_patches
+                )  # (B, N_t)
+                attention_component = attention_importance
             
             # 3. Re-compute Mahalanobis deviation on current patches (RAW - no normalization)
             if mahalanobis_scorer is not None:
@@ -191,15 +207,38 @@ class HybridPatchAnnealing(nn.Module):
             else:
                 current_freq_mahal = torch.zeros_like(spatial_mahal)
             
-            # 5. ⭐ COMBINED SCORING (spatial + frequency) - Using RAW Mahalanobis scores
-            patch_scores = (
-                alpha * attention_importance +
-                beta * spatial_mahal +
-                gamma * current_freq_mahal
+            # 5. Apply the same transform/standardization path as final scoring.
+            spatial_energy = torch.log1p(torch.clamp_min(spatial_mahal, 0.0))
+            freq_energy = torch.log1p(torch.clamp_min(current_freq_mahal, 0.0))
+
+            attn_std_safe = max(float(attn_std), 1e-6)
+            spatial_std_safe = max(float(spatial_std), 1e-6)
+            freq_std_safe = max(float(freq_std), 1e-6)
+
+            attn_standardized = (attention_component - float(attn_mean)) / attn_std_safe
+            spatial_standardized = (spatial_energy - float(spatial_mean)) / spatial_std_safe
+            freq_standardized = (freq_energy - float(freq_mean)) / freq_std_safe
+
+            attn_standardized = torch.where(
+                torch.isfinite(attn_standardized), attn_standardized, torch.zeros_like(attn_standardized)
+            )
+            spatial_standardized = torch.where(
+                torch.isfinite(spatial_standardized), spatial_standardized, torch.zeros_like(spatial_standardized)
+            )
+            freq_standardized = torch.where(
+                torch.isfinite(freq_standardized), freq_standardized, torch.zeros_like(freq_standardized)
+            )
+
+            # 6. Build anomaly score then invert for normality-based shortlist.
+            anomaly_scores = (
+                alpha * attn_standardized +
+                beta * spatial_standardized +
+                gamma * freq_standardized
             )  # (B, N_t)
-            
-            # 6. Select top-N_t patches
-            _, top_indices_local = torch.topk(patch_scores, n_t, dim=1)  # (B, n_t)
+            normality_scores = -anomaly_scores
+
+            # 7. Select top-N_t most-normal patches.
+            _, top_indices_local = torch.topk(normality_scores, n_t, dim=1)  # (B, n_t)
             
             # Map local indices back to global indices
             batch_indices = torch.arange(B, device=patch_embeds.device).unsqueeze(1)
@@ -210,7 +249,7 @@ class HybridPatchAnnealing(nn.Module):
             cls_token = current_patches.mean(dim=1, keepdim=True)
             
             # Clear intermediate tensors (but keep current_query_tokens!)
-            del qformer_outputs, attention_importance, spatial_mahal, patch_scores
+            del qformer_outputs, attention_importance, spatial_mahal, anomaly_scores, normality_scores
             if freq_scores is not None:
                 del current_freq_mahal
             if torch.cuda.is_available():

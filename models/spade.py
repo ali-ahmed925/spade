@@ -165,6 +165,54 @@ class SPADE(nn.Module):
         self.register_buffer('freq_mean', torch.tensor(0.0))
         self.register_buffer('freq_std', torch.tensor(1.0))
         self.register_buffer('_stats_count', torch.tensor(0))  # Number of batches used for statistics
+
+    def _attention_component(
+        self,
+        attention_importance: torch.Tensor,
+        raw_attention_scores: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return attention-derived anomaly component (higher = more anomalous)."""
+        if self.use_raw_attention and raw_attention_scores is not None:
+            attention_anomaly = -raw_attention_scores
+            attention_min = attention_anomaly.min(dim=1, keepdim=True)[0]
+            return attention_anomaly - attention_min
+        return attention_importance
+
+    def _standardize_components(
+        self,
+        attn_component: torch.Tensor,
+        spatial_mahal: torch.Tensor,
+        freq_mahal: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Shared transform + standardization path used by HPA shortlist and final scoring."""
+        spatial_energy = torch.log1p(torch.clamp_min(spatial_mahal, 0.0))
+        freq_energy = torch.log1p(torch.clamp_min(freq_mahal, 0.0))
+
+        if self.training:
+            batch_attn_mean = attn_component.mean()
+            batch_attn_std = torch.clamp(attn_component.std(), min=1e-6)
+            batch_spatial_mean = spatial_energy.mean()
+            batch_spatial_std = torch.clamp(spatial_energy.std(), min=1e-6)
+            batch_freq_mean = freq_energy.mean()
+            batch_freq_std = torch.clamp(freq_energy.std(), min=1e-6)
+
+            momentum = 0.1
+            self.attn_mean.mul_(1 - momentum).add_(momentum * batch_attn_mean.detach())
+            self.attn_std.mul_(1 - momentum).add_(momentum * batch_attn_std.detach())
+            self.spatial_mean.mul_(1 - momentum).add_(momentum * batch_spatial_mean.detach())
+            self.spatial_std.mul_(1 - momentum).add_(momentum * batch_spatial_std.detach())
+            self.freq_mean.mul_(1 - momentum).add_(momentum * batch_freq_mean.detach())
+            self.freq_std.mul_(1 - momentum).add_(momentum * batch_freq_std.detach())
+            self._stats_count.add_(1)
+
+        attn_std = (attn_component - self.attn_mean) / torch.clamp(self.attn_std, min=1e-6)
+        spatial_std = (spatial_energy - self.spatial_mean) / torch.clamp(self.spatial_std, min=1e-6)
+        freq_std = (freq_energy - self.freq_mean) / torch.clamp(self.freq_std, min=1e-6)
+
+        attn_std = torch.where(torch.isfinite(attn_std), attn_std, torch.zeros_like(attn_std))
+        spatial_std = torch.where(torch.isfinite(spatial_std), spatial_std, torch.zeros_like(spatial_std))
+        freq_std = torch.where(torch.isfinite(freq_std), freq_std, torch.zeros_like(freq_std))
+        return attn_std, spatial_std, freq_std, spatial_energy, freq_energy
         
     def forward(
         self,
@@ -298,6 +346,13 @@ class SPADE(nn.Module):
                 # NEW: Frequency scoring
                 freq_scores=freq_scores if self.use_mahalanobis else None,  # Disable freq scores if Mahalanobis disabled
                 gamma=self.score_gamma.item(),
+                use_raw_attention=self.use_raw_attention,
+                attn_mean=float(self.attn_mean.item()),
+                attn_std=float(self.attn_std.item()),
+                spatial_mean=float(self.spatial_mean.item()),
+                spatial_std=float(self.spatial_std.item()),
+                freq_mean=float(self.freq_mean.item()),
+                freq_std=float(self.freq_std.item()),
             )  # (B, N_min, D), (B, N_min), (B, Q, D_q)
             
             # DEBUG: Compare initial vs refined queries
@@ -393,36 +448,23 @@ class SPADE(nn.Module):
             _debug_logger.debug(f"[SPADE DEBUG] Final frequency Mahalanobis - RAW: mean={freq_mean:.4f}, "
                   f"std={freq_std:.4f}, max={freq_max:.4f}, min={freq_min:.4f}")
         
-        # Final patch scores with cross-term
-        # Option 1: Use raw attention scores (larger scale, better match with Mahalanobis)
-        # Option 2: Use softmax probabilities (smaller scale, [0, Q] range)
+        # Final patch scores: use the same anomaly-component pipeline as HPA shortlist.
+        attn_importance_norm = self._attention_component(final_attn_importance, raw_attention_scores)
+        attn_std, spatial_std, freq_std, spatial_energy, freq_energy = self._standardize_components(
+            attn_component=attn_importance_norm,
+            spatial_mahal=final_spatial_mahal,
+            freq_mahal=final_freq_mahal,
+        )
+
         if self.use_raw_attention and raw_attention_scores is not None:
-            # Use raw attention scores (before softmax, summed across queries)
-            # Raw scores can be negative (dissimilar = anomalous)
-            # Transform: negative attention → positive anomaly score
-            raw_attn = raw_attention_scores  # (B, N) - can be negative
-            
-            # Flip sign: negative attention (dissimilar) → positive anomaly score
-            attention_anomaly = -raw_attn  # (B, N)
-            
-            # Shift per image to make all positive (preserves relative differences)
-            attention_min = attention_anomaly.min(dim=1, keepdim=True)[0]  # (B, 1)
-            attn_importance_norm = attention_anomaly - attention_min  # (B, N) - now min=0 per image, all positive
-            
-            _debug_logger.debug(f"[SPADE DEBUG] Using RAW attention scores - raw mean={raw_attn.mean().item():.4f}, "
-                  f"transformed mean={attn_importance_norm.mean().item():.4f}, "
-                  f"transformed max={attn_importance_norm.max().item():.4f}")
+            _debug_logger.debug(
+                f"[SPADE DEBUG] Using RAW attention scores - raw mean={raw_attention_scores.mean().item():.4f}, "
+                f"transformed mean={attn_importance_norm.mean().item():.4f}, "
+                f"transformed max={attn_importance_norm.max().item():.4f}"
+            )
         else:
-            # Use softmax probabilities (original approach)
-            # Each query's attention weights sum to 1.0, so summing over Q queries gives [0, Q] range
-            attn_importance_norm = final_attn_importance  # (B, N) - already properly scaled
             _debug_logger.debug(f"[SPADE DEBUG] Using SOFTMAX attention (original approach)")
-        
-        # 🔥 Step 1: Log-transform Mahalanobis (handles quadratic growth, preserves ranking)
-        # log1p(x) = log(1 + x) handles zeros gracefully and compresses large values
-        spatial_energy = torch.log1p(final_spatial_mahal)  # (B, N)
-        freq_energy = torch.log1p(final_freq_mahal) if freq_scores is not None else torch.zeros_like(final_spatial_mahal)  # (B, N)
-        
+
         # DEBUG: Log energy values (after log-transform)
         spatial_energy_mean = spatial_energy.mean().item()
         spatial_energy_std = spatial_energy.std().item()
@@ -431,54 +473,6 @@ class SPADE(nn.Module):
             freq_energy_mean = freq_energy.mean().item()
             freq_energy_std = freq_energy.std().item()
             _debug_logger.debug(f"[SPADE DEBUG] Frequency energy (log1p) - mean={freq_energy_mean:.4f}, std={freq_energy_std:.4f}")
-        
-        # 🔥 Step 2: Standardize each modality using fixed statistics (computed from training data)
-        # CRITICAL: Use running statistics (like BatchNorm) to preserve absolute scale across batches
-        # During training: accumulate statistics; during eval: use fixed statistics
-        if self.training:
-            # Update running statistics during training
-            batch_attn_mean = attn_importance_norm.mean()
-            batch_attn_std = attn_importance_norm.std()
-            batch_spatial_mean = spatial_energy.mean()
-            batch_spatial_std = spatial_energy.std()
-            batch_freq_mean = freq_energy.mean()
-            batch_freq_std = freq_energy.std()
-            
-            # Exponential moving average (momentum=0.1, like BatchNorm)
-            momentum = 0.1
-            self.attn_mean = (1 - momentum) * self.attn_mean + momentum * batch_attn_mean
-            self.attn_std = (1 - momentum) * self.attn_std + momentum * batch_attn_std
-            self.spatial_mean = (1 - momentum) * self.spatial_mean + momentum * batch_spatial_mean
-            self.spatial_std = (1 - momentum) * self.spatial_std + momentum * batch_spatial_std
-            self.freq_mean = (1 - momentum) * self.freq_mean + momentum * batch_freq_mean
-            self.freq_std = (1 - momentum) * self.freq_std + momentum * batch_freq_std
-            self._stats_count += 1
-            
-            # Use current batch statistics for standardization during training
-            attn_mean_use = batch_attn_mean
-            attn_std_use = torch.clamp(batch_attn_std, min=1e-6)
-            spatial_mean_use = batch_spatial_mean
-            spatial_std_use = torch.clamp(batch_spatial_std, min=1e-6)
-            freq_mean_use = batch_freq_mean
-            freq_std_use = torch.clamp(batch_freq_std, min=1e-6)
-        else:
-            # Use fixed running statistics during evaluation (preserves absolute scale)
-            attn_mean_use = self.attn_mean
-            attn_std_use = torch.clamp(self.attn_std, min=1e-6)
-            spatial_mean_use = self.spatial_mean
-            spatial_std_use = torch.clamp(self.spatial_std, min=1e-6)
-            freq_mean_use = self.freq_mean
-            freq_std_use = torch.clamp(self.freq_std, min=1e-6)
-        
-        # Standardize using fixed statistics
-        attn_std = (attn_importance_norm - attn_mean_use) / attn_std_use
-        spatial_std = (spatial_energy - spatial_mean_use) / spatial_std_use
-        freq_std = (freq_energy - freq_mean_use) / freq_std_use
-        
-        # Replace any NaN or Inf with zeros (safety check)
-        attn_std = torch.where(torch.isfinite(attn_std), attn_std, torch.zeros_like(attn_std))
-        spatial_std = torch.where(torch.isfinite(spatial_std), spatial_std, torch.zeros_like(spatial_std))
-        freq_std = torch.where(torch.isfinite(freq_std), freq_std, torch.zeros_like(freq_std))
         
         # DEBUG: Log standardized values and running statistics
         mode_str = "TRAINING (updating stats)" if self.training else "EVAL (using fixed stats)"
