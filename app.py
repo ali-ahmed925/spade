@@ -469,9 +469,12 @@ def slot_images(category: str):
     result = []
     for p in pool:
         try:
-            with open(p, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode()
-            result.append(f"data:image/png;base64,{b64}")
+            img = PILImage.open(p).convert("RGB")
+            img.thumbnail((224, 224), PILImage.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=75)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            result.append(f"data:image/jpeg;base64,{b64}")
         except Exception:
             pass
     return result
