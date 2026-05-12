@@ -52,7 +52,7 @@ def save_localization_visualization(
     fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     fig.suptitle(
         f"{Path(image_path).name}\n"
-        f"Label: {'Anomaly' if label == 1 else 'Normal'} | "
+        f"Label: {'Anomaly' if label == 1 else ('Normal' if label == 0 else 'Unknown')} | "
         f"Score: {image_score:.4f}",
         fontsize=12,
     )
@@ -274,9 +274,76 @@ def evaluate(
     return results
 
 
+def evaluate_single_image(
+    model: SPADE,
+    image_path: str,
+    device: torch.device,
+    image_size: int,
+    patch_size: int,
+    save_dir: str | None = None,
+) -> float:
+    """Run inference on a single image, print score, and optionally save heatmap."""
+    from data.transforms import get_eval_transforms
+
+    image_np = cv2.imread(image_path)
+    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    image_np = cv2.resize(image_np, (image_size, image_size))
+
+    from PIL import Image as PILImage
+    transform = get_eval_transforms(image_size)
+    image_tensor = transform(PILImage.fromarray(image_np)).unsqueeze(0).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        outputs = model(image_tensor)
+
+    patch_scores = outputs["patch_scores"]  # (1, N)
+    image_score = float(model.get_image_score(patch_scores).cpu())
+
+    print(f"\nImage : {image_path}")
+    print(f"Score : {image_score:.6f}")
+
+    # Normalize for visualization only
+    patch_scores_np = patch_scores[0].detach().cpu().numpy()
+    p5, p95 = np.percentile(patch_scores_np, [5, 95])
+    patch_scores_clipped = np.clip(patch_scores_np, p5, p95)
+    if p95 - p5 > 1e-8:
+        patch_scores_norm = (patch_scores_clipped - p5) / (p95 - p5)
+    else:
+        patch_scores_norm = np.zeros_like(patch_scores_clipped)
+
+    hmap_viz = patches_to_heatmap(
+        torch.from_numpy(patch_scores_norm),
+        image_size=image_size,
+        patch_size=patch_size,
+        normalize=True,
+        percentile_clip=(0, 100),
+    )
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        stem = Path(image_path).stem
+        gt_mask = np.zeros((image_size, image_size), dtype=np.float32)
+        save_localization_visualization(
+            image_path=image_path,
+            image_np=image_np,
+            gt_mask=gt_mask,
+            heatmap=hmap_viz,
+            image_score=image_score,
+            label=-1,
+            output_path=os.path.join(save_dir, f"{stem}_localization.png"),
+        )
+        save_heatmap(hmap_viz, os.path.join(save_dir, f"{stem}_heatmap.png"), colormap="hot")
+        print(f"Saved  : {save_dir}/{stem}_heatmap.png")
+        print(f"Saved  : {save_dir}/{stem}_localization.png")
+
+    return image_score
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="SPADE Evaluation")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--image", type=str, default=None, help="Single image path (skips full dataset eval)")
     parser.add_argument("--save_heatmaps", type=str, default=None, help="Dir to save heatmaps (raw heatmap PNGs)")
     parser.add_argument("--save_visualizations", action="store_true", help="Save full localization visualizations (image + GT + heatmap + overlay)")
     parser.add_argument("--log_wandb", action="store_true", help="Log results to wandb")
@@ -376,6 +443,10 @@ def main() -> None:
         model.load_state_dict(state, strict=False)
         checkpoint_epoch = "unknown"
         logger.info(f"Loaded checkpoint: {args.checkpoint} (legacy format)")
+    # Move all buffers (including freq_mahalanobis_scorer.mu/sigma_inv) to device.
+    # enable_frequency_features() creates submodules on CPU; load_state_dict also
+    # keeps buffers on CPU when map_location is used. This ensures everything aligns.
+    model.to(device)
     
     # ⚠️ CRITICAL: Set HPA enabled/disabled AFTER loading checkpoint
     # Use runtime config (not checkpoint config) to allow testing different settings
@@ -415,6 +486,18 @@ def main() -> None:
     
     # Verify HPA setting is correct (double-check after potential state_dict loading)
     logger.info(f"⚠️ FINAL VERIFICATION: model.use_hpa = {model.use_hpa} (type: {type(model.use_hpa)}, should match config: {use_hpa})")
+
+    # ── Single-image mode ──
+    if args.image is not None:
+        evaluate_single_image(
+            model=model,
+            image_path=args.image,
+            device=device,
+            image_size=cfg["vit"]["image_size"],
+            patch_size=cfg["vit"]["patch_size"],
+            save_dir=args.save_heatmaps,
+        )
+        return
 
     # ── Evaluate ──
     results = evaluate(
