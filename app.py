@@ -94,7 +94,7 @@ def _build_image_pool(max_defect: int = 30, max_normal: int = 10) -> Dict[str, l
 
 _IMAGE_POOL = _build_image_pool(max_defect=30, max_normal=10)
 
-_LLM_ENDPOINT = "https://uninvited-amniotic-flail.ngrok-free.dev/v1/chat/completions"
+_LLM_ENDPOINT = "http://localhost:11434/v1/chat/completions"
 _LLM_MODEL    = "llama3.2-vision:11b"   # switch: "qwen2.5vl:32b" | "llama3.2-vision:11b"
 
 # ── Per-class visual context for the vision model ─────────────────────────────
@@ -457,16 +457,24 @@ def serve_image(category: str, image_path: str):
 
 @app.get("/api/slot-images/{category}")
 def slot_images(category: str):
-    """Return up to 10 defect image URLs for the slot-machine animation."""
+    """Return up to 10 defect images as base64 data URIs for the slot-machine animation.
+
+    Embeds images directly to avoid per-image round trips through the tunnel.
+    """
     test_dir = os.path.join(DATASET_ROOT, category, "test")
     all_imgs = list(Path(test_dir).rglob("*.png"))
     defect = [p for p in all_imgs if "good" not in p.parts]
     random.shuffle(defect)
     pool = defect[:10] if len(defect) >= 10 else defect
-    return [
-        f"/api/image/{category}/{Path(p).relative_to(os.path.join(DATASET_ROOT, category))}"
-        for p in pool
-    ]
+    result = []
+    for p in pool:
+        try:
+            with open(p, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            result.append(f"data:image/png;base64,{b64}")
+        except Exception:
+            pass
+    return result
 
 
 @app.post("/api/select-image")
