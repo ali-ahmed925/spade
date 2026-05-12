@@ -391,6 +391,18 @@ def main() -> None:
         image_score_mode=(cfg["scoring"].get("image_score") or {}).get("mode", "quantile"),
         image_score_quantile=float((cfg["scoring"].get("image_score") or {}).get("quantile", 0.99)),
         image_score_top_k=int((cfg["scoring"].get("image_score") or {}).get("top_k", 3)),
+        # GMM scoring (optional)
+        use_gmm=bool((cfg["scoring"].get("gmm") or {}).get("enabled", False)),
+        gmm_spatial_components=int((cfg["scoring"].get("gmm") or {}).get("spatial_components", 8)),
+        gmm_freq_components=int((cfg["scoring"].get("gmm") or {}).get("freq_components", 5)),
+        gmm_covariance_type=str((cfg["scoring"].get("gmm") or {}).get("covariance_type", "full")),
+        gmm_reg_covar=float((cfg["scoring"].get("gmm") or {}).get("reg_covar", 1e-4)),
+        gmm_fit_max_samples=(
+            None
+            if (cfg["scoring"].get("gmm") or {}).get("fit_max_samples", 15000) in (None, 0, "0")
+            else int((cfg["scoring"].get("gmm") or {}).get("fit_max_samples", 15000))
+        ),
+        gmm_fit_subsample_seed=int((cfg["scoring"].get("gmm") or {}).get("fit_subsample_seed", 42)),
     ).to(device)
 
     # Enable frequency features if configured (before loading checkpoint)
@@ -473,7 +485,10 @@ def main() -> None:
     
     # Log Mahalanobis status
     if model.use_mahalanobis:
-        logger.info("✅ Mahalanobis scoring enabled")
+        if getattr(model, "use_gmm", False):
+            logger.info("✅ Patch density scoring: GMM (multi-component) enabled")
+        else:
+            logger.info("✅ Mahalanobis scoring enabled")
     else:
         logger.info("❌ Mahalanobis scoring DISABLED - using only attention scores")
     

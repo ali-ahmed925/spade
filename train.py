@@ -396,6 +396,18 @@ def main() -> None:
         image_score_mode=(cfg["scoring"].get("image_score") or {}).get("mode", "quantile"),
         image_score_quantile=float((cfg["scoring"].get("image_score") or {}).get("quantile", 0.99)),
         image_score_top_k=int((cfg["scoring"].get("image_score") or {}).get("top_k", 3)),
+        # GMM scoring (optional)
+        use_gmm=bool((cfg["scoring"].get("gmm") or {}).get("enabled", False)),
+        gmm_spatial_components=int((cfg["scoring"].get("gmm") or {}).get("spatial_components", 8)),
+        gmm_freq_components=int((cfg["scoring"].get("gmm") or {}).get("freq_components", 5)),
+        gmm_covariance_type=str((cfg["scoring"].get("gmm") or {}).get("covariance_type", "full")),
+        gmm_reg_covar=float((cfg["scoring"].get("gmm") or {}).get("reg_covar", 1e-4)),
+        gmm_fit_max_samples=(
+            None
+            if (cfg["scoring"].get("gmm") or {}).get("fit_max_samples", 15000) in (None, 0, "0")
+            else int((cfg["scoring"].get("gmm") or {}).get("fit_max_samples", 15000))
+        ),
+        gmm_fit_subsample_seed=int((cfg["scoring"].get("gmm") or {}).get("fit_subsample_seed", 42)),
     ).to(device)
 
     # Enable/disable HPA based on config
@@ -405,9 +417,12 @@ def main() -> None:
     model.use_hpa = use_hpa
     logger.info(f"🔧 SET model.use_hpa = {use_hpa} (type: {type(use_hpa)})")
     
-    # Log Mahalanobis status
+    # Log Mahalanobis / GMM status
     if model.use_mahalanobis:
-        logger.info("✅ Mahalanobis scoring enabled")
+        if getattr(model, "use_gmm", False):
+            logger.info("✅ Patch density scoring: GMM (multi-component) enabled")
+        else:
+            logger.info("✅ Mahalanobis scoring enabled")
     else:
         logger.info("❌ Mahalanobis scoring DISABLED - using only attention scores")
     logger.info(
@@ -531,15 +546,30 @@ def main() -> None:
             f"patch: {metrics['patch']:.4f}"
         )
         
-        # Compute Mahalanobis statistics once after first epoch (using all collected normal patches)
+        # Compute density statistics once after first epoch (using all collected normal patches)
         if epoch == 1 and model.use_mahalanobis:
-            logger.info("Computing Mahalanobis statistics from all collected normal patches...")
+            if getattr(model, "use_gmm", False):
+                logger.info("Fitting spatial and frequency GMMs from all collected normal patches...")
+            else:
+                logger.info("Computing Mahalanobis statistics from all collected normal patches...")
             model.compute_statistics_once(device=device)
             num_spatial = len(model.normal_stats_tracker.normal_patch_buffer)
-            logger.info(f"✅ Computed spatial Mahalanobis statistics from {num_spatial} normal patches")
+            if getattr(model, "use_gmm", False) and model.gmm_scorer is not None:
+                if model.gmm_scorer.is_initialized.item():
+                    logger.info(f"✅ Spatial GMM fitted ({num_spatial} normal patches in buffer)")
+                else:
+                    logger.error("❌ Spatial GMM did not initialize — density branch uses zeros until refit succeeds.")
+            else:
+                logger.info(f"✅ Computed spatial Mahalanobis statistics from {num_spatial} normal patches")
             if model.use_frequency and model.freq_normal_stats_tracker is not None:
                 num_freq = len(model.freq_normal_stats_tracker.normal_patch_buffer)
-                logger.info(f"✅ Computed frequency Mahalanobis statistics from {num_freq} normal patches")
+                if getattr(model, "use_gmm", False) and model.freq_gmm_scorer is not None:
+                    if model.freq_gmm_scorer.is_initialized.item():
+                        logger.info(f"✅ Frequency GMM fitted ({num_freq} normal patches in buffer)")
+                    else:
+                        logger.error("❌ Frequency GMM did not initialize — frequency density branch uses zeros.")
+                else:
+                    logger.info(f"✅ Computed frequency Mahalanobis statistics from {num_freq} normal patches")
 
         # ── Validation (real test anomalies or synthetic) ──
         if val_loader is not None:

@@ -14,6 +14,7 @@ from models.vit import FrozenVisionEncoder
 from models.qformer import Blip2QFormerWrapper
 from models.projection import LLMProjection
 from models.hierarchical_patch_refinement import HybridPatchAnnealing, QueryPatchAttention
+from models.gmm_scorer import GMMScorer
 from models.mahalanobis_scoring import MahalanobisScoring
 from models.normal_statistics import NormalStatisticsTracker
 from utils.debug_logger import get_debug_logger
@@ -60,6 +61,14 @@ class SPADE(nn.Module):
         image_score_mode: str = "quantile",
         image_score_quantile: float = 0.99,
         image_score_top_k: int = 3,
+        # GMM (optional, replaces single-Gaussian Mahalanobis when enabled)
+        use_gmm: bool = False,
+        gmm_spatial_components: int = 8,
+        gmm_freq_components: int = 5,
+        gmm_covariance_type: str = "full",
+        gmm_reg_covar: float = 1e-4,
+        gmm_fit_max_samples: int | None = 15000,
+        gmm_fit_subsample_seed: int = 42,
     ):
         super().__init__()
         
@@ -102,12 +111,32 @@ class SPADE(nn.Module):
             patch_dim=vit_dim,
         )
         
-        # Mahalanobis Scoring
-        self.mahalanobis_scorer = MahalanobisScoring(
-            feature_dim=vit_dim,
-            regularization=mahalanobis_reg,
-            gamma=mahalanobis_gamma,
-        )
+        # Density Scoring (GMM or single-Gaussian Mahalanobis)
+        self.use_gmm = bool(use_gmm) and use_mahalanobis
+        self._gmm_freq_n = int(gmm_freq_components)
+        self._gmm_covariance_type = str(gmm_covariance_type)
+        self._gmm_reg_covar = float(gmm_reg_covar)
+        self._gmm_fit_max_samples = None if gmm_fit_max_samples in (None, 0, "0") else int(gmm_fit_max_samples)
+        self._gmm_fit_subsample_seed = int(gmm_fit_subsample_seed)
+
+        self.gmm_scorer: GMMScorer | None = None
+        self.mahalanobis_scorer: MahalanobisScoring | None = None
+        if self.use_gmm:
+            self.gmm_scorer = GMMScorer(
+                feature_dim=vit_dim,
+                n_components=int(gmm_spatial_components),
+                covariance_type=self._gmm_covariance_type,
+                reg_covar=self._gmm_reg_covar,
+                gamma=mahalanobis_gamma,
+                fit_max_samples=self._gmm_fit_max_samples,
+                fit_subsample_seed=self._gmm_fit_subsample_seed,
+            )
+        else:
+            self.mahalanobis_scorer = MahalanobisScoring(
+                feature_dim=vit_dim,
+                regularization=mahalanobis_reg,
+                gamma=mahalanobis_gamma,
+            )
         
         # Normal Statistics Tracker
         self.normal_stats_tracker = NormalStatisticsTracker(
@@ -153,6 +182,7 @@ class SPADE(nn.Module):
         # Frequency feature extractor (optional, enabled via enable_frequency_features)
         self.use_frequency = False
         self.freq_extractor = None
+        self.freq_gmm_scorer: GMMScorer | None = None
         self.freq_mahalanobis_scorer = None
         self.freq_normal_stats_tracker = None
         
@@ -165,6 +195,16 @@ class SPADE(nn.Module):
         self.register_buffer('freq_mean', torch.tensor(0.0))
         self.register_buffer('freq_std', torch.tensor(1.0))
         self.register_buffer('_stats_count', torch.tensor(0))  # Number of batches used for statistics
+
+    def _spatial_density_scorer(self) -> GMMScorer | MahalanobisScoring | None:
+        if not self.use_mahalanobis:
+            return None
+        return self.gmm_scorer if self.use_gmm else self.mahalanobis_scorer
+
+    def _freq_density_scorer(self) -> GMMScorer | MahalanobisScoring | None:
+        if not self.use_mahalanobis or not self.use_frequency:
+            return None
+        return self.freq_gmm_scorer if self.use_gmm else self.freq_mahalanobis_scorer
 
     def _attention_component(
         self,
@@ -289,7 +329,8 @@ class SPADE(nn.Module):
             
             # Compute frequency Mahalanobis scores (only if Mahalanobis is enabled)
             if self.use_mahalanobis:
-                freq_scores = self.freq_mahalanobis_scorer(freq_features)  # (B, 256)
+                freq_scorer = self._freq_density_scorer()
+                freq_scores = freq_scorer(freq_features) if freq_scorer is not None else None  # (B, 256)
             else:
                 freq_scores = None  # Disabled
         
@@ -331,8 +372,8 @@ class SPADE(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            # Use dummy scorer if Mahalanobis is disabled
-            mahalanobis_scorer_for_hpa = self.mahalanobis_scorer if self.use_mahalanobis else None
+            # Use density scorer (GMM or Mahalanobis), or None when disabled
+            mahalanobis_scorer_for_hpa = self._spatial_density_scorer() if self.use_mahalanobis else None
             
             refined_patches, selected_indices, final_refined_queries = self.hpa(
                 patch_embeds=patch_embeds,
@@ -414,7 +455,10 @@ class SPADE(nn.Module):
         
         # Final Mahalanobis scores on all patches (RAW - no normalization)
         if self.use_mahalanobis:
-            final_spatial_mahal = self.mahalanobis_scorer(patch_embeds)  # (B, N)
+            spatial_scorer = self._spatial_density_scorer()
+            final_spatial_mahal = spatial_scorer(patch_embeds) if spatial_scorer is not None else torch.zeros(
+                patch_embeds.shape[0], patch_embeds.shape[1], device=patch_embeds.device, dtype=patch_embeds.dtype
+            )  # (B, N)
         else:
             final_spatial_mahal = torch.zeros_like(patch_embeds[:, :, 0])  # (B, N) - zeros when disabled
         
@@ -699,7 +743,10 @@ class SPADE(nn.Module):
                 device = next(self.parameters()).device
                 normal_patches = normal_patches.to(device)
             
-            self.mahalanobis_scorer.update_statistics(normal_patches)
+            if self.use_gmm and self.gmm_scorer is not None:
+                self.gmm_scorer.fit(normal_patches)
+            elif self.mahalanobis_scorer is not None:
+                self.mahalanobis_scorer.update_statistics(normal_patches)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
@@ -713,7 +760,10 @@ class SPADE(nn.Module):
                     device = next(self.parameters()).device
                 normal_freq = normal_freq.to(device)
                 
-                self.freq_mahalanobis_scorer.update_statistics(normal_freq)
+                if self.use_gmm and self.freq_gmm_scorer is not None:
+                    self.freq_gmm_scorer.fit(normal_freq)
+                elif self.freq_mahalanobis_scorer is not None:
+                    self.freq_mahalanobis_scorer.update_statistics(normal_freq)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
     
@@ -925,12 +975,27 @@ class SPADE(nn.Module):
             feature_dim=freq_feature_dim,
         )
         
-        # Separate Mahalanobis scorer for frequency
-        self.freq_mahalanobis_scorer = MahalanobisScoring(
-            feature_dim=freq_feature_dim,
-            regularization=self.mahalanobis_scorer.regularization,
-            gamma=self.mahalanobis_scorer.gamma,
-        )
+        # Separate frequency density scorer (GMM or Mahalanobis, matching spatial setting)
+        if self.use_gmm and self.gmm_scorer is not None:
+            self.freq_gmm_scorer = GMMScorer(
+                feature_dim=freq_feature_dim,
+                n_components=self._gmm_freq_n,
+                covariance_type=self._gmm_covariance_type,
+                reg_covar=self._gmm_reg_covar,
+                gamma=float(self.gmm_scorer.gamma),
+                fit_max_samples=self._gmm_fit_max_samples,
+                fit_subsample_seed=self._gmm_fit_subsample_seed,
+            )
+            self.freq_mahalanobis_scorer = None
+        else:
+            reg = self.mahalanobis_scorer.regularization if self.mahalanobis_scorer is not None else 1e-4
+            gam = self.mahalanobis_scorer.gamma if self.mahalanobis_scorer is not None else 1.0
+            self.freq_mahalanobis_scorer = MahalanobisScoring(
+                feature_dim=freq_feature_dim,
+                regularization=reg,
+                gamma=gam,
+            )
+            self.freq_gmm_scorer = None
         
         # Frequency statistics tracker
         self.freq_normal_stats_tracker = NormalStatisticsTracker(

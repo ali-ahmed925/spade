@@ -27,6 +27,15 @@ scoring:
   lambda: 0.001                            # Cross-term weight (MINIMAL)
   mahalanobis_gamma: 1.0                  # Non-linear amplification factor (1.0 = no amplification)
   mahalanobis_reg: 1e-4                   # Covariance regularization (increased for stability)
+  # GMM density (optional; replaces single-Gaussian Mahalanobis when enabled)
+  gmm:
+    enabled: true                        # true = sklearn GMM NLL scoring; false = classic Mahalanobis
+    spatial_components: 8                 # K for ViT patch features
+    freq_components: 5                    # K for frequency features
+    covariance_type: full                 # sklearn GaussianMixture covariance_type
+    reg_covar: 1.0e-4                     # regularization added to covariances (sklearn reg_covar)
+    fit_max_samples: 15000                # max normal patches used to fit GMM (subsampling; 0 or null = use all)
+    fit_subsample_seed: 42                # RNG seed for subsample (fit only; inference uses full image)
   verify_attention: false                 # Enable attention verification (logs and visualizes attention on normal vs anomalous patches)
   use_raw_attention: true                 # Use raw attention scores instead of softmax probabilities (larger scale, better match with Mahalanobis)
   # Image-level score from patch scores (AUROC / inference)
