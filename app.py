@@ -52,11 +52,11 @@ HYPERPARAMS     = CFG["hyperparameters"]
 MODE            = CFG.get("mode", "localhost").upper()
 
 
-def _build_image_pool(max_defect: int = 30, max_normal: int = 10) -> Dict[str, list]:
-    """Scan test directories and build a pool of up to max_defect defect images
-    plus up to max_normal normal images (from test/good/) per category.
+def _build_image_pool(max_defect: int = 30) -> Dict[str, list]:
+    """Scan test directories and build a pool of up to max_defect defect images.
 
-    Falls back to curated list if the test dir doesn't exist or is empty.
+    Excludes the 'good' subfolder. Falls back to curated list if the test dir
+    doesn't exist or is empty.
     """
     pool: Dict[str, list] = {}
     for cat in CURATED.keys():
@@ -64,7 +64,6 @@ def _build_image_pool(max_defect: int = 30, max_normal: int = 10) -> Dict[str, l
         cat_root = os.path.join(DATASET_ROOT, cat)
         discovered: list = []
         if os.path.isdir(test_dir):
-            # Defect images — exclude good/
             defect_imgs = [
                 p for p in Path(test_dir).rglob("*.png")
                 if "good" not in p.parts
@@ -74,15 +73,6 @@ def _build_image_pool(max_defect: int = 30, max_normal: int = 10) -> Dict[str, l
                 str(p.relative_to(cat_root))
                 for p in defect_imgs[:max_defect]
             ]
-            # Normal images — only from test/good/
-            good_dir = os.path.join(test_dir, "good")
-            if os.path.isdir(good_dir):
-                normal_imgs = list(Path(good_dir).glob("*.png"))
-                random.shuffle(normal_imgs)
-                discovered += [
-                    str(p.relative_to(cat_root))
-                    for p in normal_imgs[:max_normal]
-                ]
         if discovered:
             pool[cat] = discovered
             print(f"[SPADE] Image pool: {cat} → {len(discovered)} images")
@@ -92,7 +82,7 @@ def _build_image_pool(max_defect: int = 30, max_normal: int = 10) -> Dict[str, l
     return pool
 
 
-_IMAGE_POOL = _build_image_pool(max_defect=30, max_normal=10)
+_IMAGE_POOL = _build_image_pool(max_defect=30)
 
 _LLM_ENDPOINT = "http://localhost:11434/v1/chat/completions"
 _LLM_MODEL    = "llama3.2-vision:11b"   # switch: "qwen2.5vl:32b" | "llama3.2-vision:11b"
