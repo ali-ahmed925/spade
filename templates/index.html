@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SPADE — Industrial Anomaly Detection</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;800&family=DM+Sans:wght@300;400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+
+<!-- ── Boot screen ─────────────────────────────────────────────────────────── -->
+<div id="boot">
+  <div class="boot-inner">
+    <div class="boot-logo">SPADE</div>
+    <div class="boot-sub">Initializing inference pipeline…</div>
+    <div class="boot-scanner"><div class="boot-scan-line"></div></div>
+  </div>
+</div>
+
+<!-- ── Fixed background orbs (shared by landing + app) ───────────────────── -->
+<div class="orbs" aria-hidden="true">
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+</div>
+
+<!-- ── Landing screen ─────────────────────────────────────────────────────── -->
+<div id="landingScreen" class="landing-screen">
+  <div class="landing-inner">
+    <div class="landing-logo-wrap">
+      <div class="landing-logo">SPADE</div>
+      <div class="landing-tagline">Synthetic Patch-Aware Anomaly Detection with Q-Former Embeddings</div>
+    </div>
+    <h2 class="landing-heading">Select Inspection Category</h2>
+    <div id="catGrid" class="cat-grid"></div>
+  </div>
+</div>
+
+<!-- ── Main app (hidden until category selected) ──────────────────────────── -->
+<div id="app" class="app" style="opacity:0;pointer-events:none;transform:translateY(40px)">
+
+  <!-- Header -->
+  <header id="header">
+    <div class="header-left">
+      <button class="back-btn" id="backBtn" onclick="showLanding()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M10 3L5 8l5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Categories
+      </button>
+      <div class="header-divider back-divider"></div>
+      <div class="logo-stack">
+        <span class="logo">SPADE</span>
+        <span class="logo-full">Synthetic Patch-Aware Anomaly Detection</span>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="ping-wrap" title="System status">
+        <div class="ping-dot" id="pingDot"></div>
+        <div class="ping-ring ping-ring-1" id="pingRing1"></div>
+        <div class="ping-ring ping-ring-2" id="pingRing2"></div>
+      </div>
+      <span class="status-text" id="statusText">Model Ready</span>
+      <div class="mode-chip" id="modeChip">LOCALHOST</div>
+    </div>
+  </header>
+
+  <!-- Three-column layout -->
+  <div class="layout">
+
+    <!-- ── Left sidebar ───────────────────────────────────────────────────── -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <span class="section-label">Model Configuration</span>
+        <div class="accent-line" id="accentLine"></div>
+      </div>
+      <div id="cfgRows" class="cfg-rows"></div>
+    </aside>
+
+    <!-- ── Center panel ───────────────────────────────────────────────────── -->
+    <main class="center">
+
+      <!-- Image card -->
+      <div class="image-card">
+        <div class="image-area" id="imageArea">
+          <div class="idle-state" id="idleState">
+            <div class="idle-icon">
+              <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                <polygon points="24,4 44,36 4,36" stroke="#334155" stroke-width="2" fill="none" stroke-linejoin="round"/>
+                <line x1="24" y1="16" x2="24" y2="26" stroke="#334155" stroke-width="2" stroke-linecap="round"/>
+                <circle cx="24" cy="31" r="1.5" fill="#334155"/>
+              </svg>
+            </div>
+            <p class="idle-text">Select a category to begin</p>
+          </div>
+        </div>
+        <div class="image-footer">
+          <span class="image-meta mono" id="imageMeta">—</span>
+          <span class="cat-label mono" id="catLabel"></span>
+        </div>
+      </div>
+
+      <!-- Run button -->
+      <div class="run-section">
+        <button class="run-btn" id="runBtn" disabled onclick="runAnalysis()">
+          <span class="run-btn-radar" id="radarIcon"></span>
+          <span class="run-btn-text">Run SPADE Analysis</span>
+          <span class="run-btn-arrow">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+        </button>
+        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="status-terminal" id="statusTerminal">
+          <span class="terminal-prompt">›</span>
+          <span class="terminal-msg" id="terminalMsg"></span>
+          <span class="terminal-cursor" id="termCursor"></span>
+        </div>
+      </div>
+    </main>
+
+    <!-- ── Right panel ────────────────────────────────────────────────────── -->
+    <aside class="results-panel" id="resultsPanel">
+      <div class="section-label" style="margin-bottom:0">Analysis Results</div>
+
+      <!-- Circular gauge -->
+      <div class="gauge-card" id="gaugeCard">
+        <div class="gauge-wrap">
+          <svg class="gauge-svg" viewBox="0 0 200 180" width="200" height="180">
+            <defs>
+              <linearGradient id="gaugeGrad" gradientUnits="userSpaceOnUse" x1="20" y1="140" x2="180" y2="20">
+                <stop offset="0%"   stop-color="#10B981"/>
+                <stop offset="45%"  stop-color="#F59E0B"/>
+                <stop offset="100%" stop-color="#EF4444"/>
+              </linearGradient>
+            </defs>
+            <g id="gaugeTicks" opacity="0.3"></g>
+            <circle cx="100" cy="120" r="72"
+              fill="none" stroke="#1E2D42" stroke-width="10"
+              stroke-dasharray="339 113"
+              stroke-linecap="round"
+              transform="rotate(135 100 120)"/>
+            <circle cx="100" cy="120" r="72"
+              fill="none" stroke="url(#gaugeGrad)" stroke-width="10"
+              stroke-dasharray="339 113"
+              stroke-linecap="round"
+              transform="rotate(135 100 120)"/>
+            <circle id="gaugeOverlay" cx="100" cy="120" r="72"
+              fill="none" stroke="#050810" stroke-width="12"
+              stroke-dasharray="339 0"
+              stroke-linecap="butt"
+              transform="rotate(135 100 120)"
+              style="transition:stroke-dasharray 1.2s cubic-bezier(0.4,0,0.2,1)"/>
+            <g id="gaugeNeedle" style="transform-origin:100px 120px;transform:rotate(-135deg);transition:transform 1.2s cubic-bezier(0.4,0,0.2,1)">
+              <polygon points="100,52 97,120 103,120" fill="#F1F5F9" opacity="0.9"/>
+            </g>
+            <circle cx="100" cy="120" r="8" fill="#0C1220" stroke="#1E2D42" stroke-width="2"/>
+            <circle cx="100" cy="120" r="4" fill="#2563EB"/>
+          </svg>
+          <div class="gauge-readout">
+            <div class="gauge-readout-val" id="gaugeVal">—</div>
+            <div class="gauge-readout-lbl">ANOMALY SCORE</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Verdict -->
+      <div id="verdictSlot">
+        <div class="verdict-placeholder">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" opacity="0.3">
+            <circle cx="10" cy="10" r="8" stroke="#64748B" stroke-width="1.5"/>
+            <path d="M10 6v4M10 13h.01" stroke="#64748B" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span>Run analysis to see verdict</span>
+        </div>
+      </div>
+
+      <!-- Confidence bar -->
+      <div class="conf-card">
+        <div class="conf-header">
+          <span class="conf-label">Detection Confidence</span>
+          <span class="conf-val mono" id="confVal">—</span>
+        </div>
+        <div class="conf-track">
+          <div class="conf-fill" id="confFill"></div>
+          <div class="conf-glow" id="confGlow"></div>
+        </div>
+      </div>
+
+      <!-- Terminal explanation -->
+      <div class="terminal-card">
+        <div class="terminal-titlebar">
+          <div class="terminal-dots-row">
+            <span class="tdot" style="background:#EF4444"></span>
+            <span class="tdot" style="background:#F59E0B"></span>
+            <span class="tdot" style="background:#10B981"></span>
+          </div>
+          <span class="terminal-title-text">DEFECT ANALYSIS MODULE</span>
+        </div>
+        <div class="terminal-body" id="terminalBody">
+          <div class="term-placeholder">
+            <span class="term-ph-text">Awaiting inference output…</span>
+          </div>
+        </div>
+      </div>
+
+    </aside>
+  </div>
+</div>
+
+<script src="/static/icons.js?v=7"></script>
+<script src="/static/app.js?v=7"></script>
+</body>
+</html>

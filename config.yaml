@@ -1,0 +1,122 @@
+mode: localhost        # "localhost" or "server"
+host: 0.0.0.0
+port: 8000
+
+dataset_root: /home/owais/spade/datasets/mvtec_anomaly_detection
+checkpoints_root: /home/owais/spade/checkpoints
+
+curated_images:
+  bottle:
+    - test/broken_large/000.png
+    - test/broken_large/002.png
+    - test/broken_large/004.png
+    - test/broken_small/000.png
+    - test/broken_small/003.png
+    - test/contamination/000.png
+    - test/contamination/002.png
+  cable:
+    - test/bent_wire/000.png
+    - test/bent_wire/002.png
+    - test/cable_swap/000.png
+    - test/cut_inner_insulation/000.png
+    - test/cut_outer_insulation/000.png
+    - test/combined/000.png
+  capsule:
+    - test/crack/000.png
+    - test/crack/002.png
+    - test/faulty_imprint/000.png
+    - test/poke/000.png
+    - test/scratch/000.png
+    - test/squeeze/000.png
+  carpet:
+    - test/color/000.png
+    - test/color/002.png
+    - test/cut/000.png
+    - test/hole/000.png
+    - test/metal_contamination/000.png
+    - test/thread/000.png
+  grid:
+    - test/bent/000.png
+    - test/bent/002.png
+    - test/broken/000.png
+    - test/glue/000.png
+    - test/metal_contamination/000.png
+    - test/thread/000.png
+  hazelnut:
+    - test/crack/000.png
+    - test/crack/002.png
+    - test/cut/000.png
+    - test/hole/000.png
+    - test/print/000.png
+  leather:
+    - test/color/000.png
+    - test/cut/000.png
+    - test/fold/000.png
+    - test/glue/000.png
+    - test/poke/000.png
+  pill:
+    - test/color/000.png
+    - test/combined/000.png
+    - test/contamination/000.png
+    - test/crack/000.png
+    - test/faulty_imprint/000.png
+  screw:
+    - test/manipulated_front/000.png
+    - test/manipulated_front/002.png
+    - test/scratch_head/000.png
+    - test/scratch_neck/000.png
+    - test/thread_side/001.png
+    - test/thread_top/001.png
+  toothbrush:
+    - test/defective/000.png
+    - test/defective/002.png
+    - test/defective/004.png
+    - test/defective/006.png
+  transistor:
+    - test/bent_lead/000.png
+    - test/bent_lead/002.png
+    - test/cut_lead/000.png
+    - test/damaged_case/000.png
+    - test/misplaced/000.png
+  wood:
+    - test/color/000.png
+    - test/combined/000.png
+    - test/hole/000.png
+    - test/liquid/000.png
+    - test/scratch/000.png
+  zipper:
+    - test/broken_teeth/000.png
+    - test/broken_teeth/002.png
+    - test/combined/000.png
+    - test/fabric_border/000.png
+    - test/fabric_interior/000.png
+    - test/rough/000.png
+
+# Per-category anomaly score thresholds for verdict
+thresholds:
+  bottle: 100.0
+  cable: 100.0
+  capsule: 100.0
+  carpet: 100.0
+  grid: 100.0
+  hazelnut: 100.0
+  leather: 100.0
+  pill: 100.0
+  screw: 0.003
+  toothbrush: 100.0
+  transistor: 100.0
+  wood: 100.0
+  zipper: 100.0
+
+hyperparameters:
+  backbone: "ViT-G (BLIP-2)"
+  n_queries: 32
+  n_min: 32
+  n_max: 256
+  HPA: true
+  alpha: 0.25
+  beta: 0.65
+  gamma: 0.10
+  frequency_stream: true
+  scoring: "Dual Mahalanobis"
+  aggregation: "Top-3 Mean Pooling"
