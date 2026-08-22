@@ -415,6 +415,9 @@ def main() -> None:
         # Normal statistics parameters
         normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
+        # Scoring-correctness knobs (default to the corrected behaviour)
+        normalize_streams=cfg.get("scoring", {}).get("normalize_streams", True),
+        attention_aggregation=cfg.get("scoring", {}).get("attention_aggregation", "logit_mean"),
     ).to(device)
 
     # Enable frequency features if configured (before loading checkpoint)

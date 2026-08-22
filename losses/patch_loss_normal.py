@@ -53,34 +53,61 @@ class MahalanobisPatchLoss(nn.Module):
 
 
 class PseudoAnomalyLoss(nn.Module):
-    """
-    Optional: small perturbation on normal embeddings to simulate soft negatives.
-    Encourages Q-Former to separate slightly perturbed normals from true normals.
-    
-    This adds a contrastive component: normal patches should be closer to the mean
-    than slightly perturbed versions of themselves.
+    """Margin loss pushing perturbed (pseudo-anomalous) patches above clean ones.
+
+    HISTORY / BUG
+    -------------
+    The original implementation was::
+
+        perturbed_scores = scores + self.epsilon * torch.randn_like(scores)
+        loss = F.relu(perturbed_scores - scores).mean()
+
+    ``scores`` cancels algebraically, leaving ``relu(epsilon * noise)`` — a
+    random constant with respect to every parameter in the model. Its gradient
+    is *exactly* zero (verified in tests/test_gradient_flow.py), so the term
+    contributed nothing but noise to the reported loss value.
+
+    FIX
+    ---
+    The perturbation must be applied where the score actually comes from — the
+    patch embeddings — and the perturbed patch must then be re-scored by the
+    model. ``SPADE._score_perturbed`` does that and hands both score tensors
+    here. The objective is a margin: a perturbed patch should score at least
+    ``margin`` higher than the clean patch it came from.
     """
 
-    def __init__(self, epsilon: float = 0.01):
+    def __init__(self, epsilon: float = 0.01, margin: float = 0.1):
         """
         Args:
-            epsilon: magnitude of random perturbation
+            epsilon: perturbation magnitude (applied by the model, kept here for
+                bookkeeping and for backwards-compatible construction).
+            margin: how much higher a perturbed patch should score.
         """
         super().__init__()
         self.epsilon = epsilon
+        self.margin = margin
 
-    def forward(self, scores: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        scores: torch.Tensor,
+        perturbed_scores: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            scores: (B, N) Mahalanobis distances for normal patches
-        Returns:
-            scalar loss encouraging perturbed patches to have higher scores
-        """
-        # Random small perturbation (additive noise)
-        perturbed_scores = scores + self.epsilon * torch.randn_like(scores)
-        
-        # Encourage perturbed patches to have slightly higher scores than normal
-        # This creates a margin: normal < perturbed
-        loss = F.relu(perturbed_scores - scores).mean()
-        return loss
+            scores: (B, N) scores for the clean patches.
+            perturbed_scores: (B, N) scores for the perturbed copies of the SAME
+                patches, produced by re-running the scoring path on perturbed
+                embeddings.
 
+        Returns:
+            scalar margin loss.
+        """
+        if perturbed_scores is None:
+            raise ValueError(
+                "PseudoAnomalyLoss requires perturbed_scores computed from perturbed "
+                "embeddings. Pass perturb_epsilon to SPADE.forward() so the model "
+                "returns 'patch_scores_perturbed'."
+            )
+        # want: perturbed >= clean + margin
+        violation = self.margin - (perturbed_scores - scores)
+        return F.relu(violation).mean()

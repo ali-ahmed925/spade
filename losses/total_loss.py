@@ -31,6 +31,7 @@ class TotalLoss(nn.Module):
         var_weight: float = 0.1,
         use_pseudo: bool = False,
         pseudo_epsilon: float = 0.01,
+        pseudo_margin: float = 0.1,
         clamp_max: float = 100.0,
     ) -> None:
         """
@@ -56,7 +57,9 @@ class TotalLoss(nn.Module):
                 lambda_var=var_weight,
             )
             if use_pseudo:
-                self.pseudo_loss_fn = PseudoAnomalyLoss(epsilon=pseudo_epsilon)
+                self.pseudo_loss_fn = PseudoAnomalyLoss(
+                    epsilon=pseudo_epsilon, margin=pseudo_margin
+                )
             else:
                 self.pseudo_loss_fn = None
         else:
@@ -72,6 +75,7 @@ class TotalLoss(nn.Module):
         patch_targets: torch.Tensor,
         query_embeds: torch.Tensor,
         labels: torch.Tensor,
+        patch_scores_perturbed: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -93,9 +97,11 @@ class TotalLoss(nn.Module):
                 "patch": l_patch,
             }
             
-            # Add pseudo-anomaly loss if enabled
+            # Add pseudo-anomaly loss if enabled. Requires the model to have
+            # scored a perturbed copy of the patches (perturb_epsilon != None);
+            # scoring-level perturbation cancels and has zero gradient.
             if self.pseudo_loss_fn is not None:
-                l_pseudo = self.pseudo_loss_fn(patch_scores)
+                l_pseudo = self.pseudo_loss_fn(patch_scores, patch_scores_perturbed)
                 result["pseudo"] = l_pseudo
                 result["total"] = result["total"] + l_pseudo
         else:

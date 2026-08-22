@@ -27,22 +27,44 @@ def test_hpa_compute_n_t():
 
 
 def test_query_patch_attention():
-    """Test query-patch attention computation."""
+    """Shapes and softmax normalization hold for either aggregation mode."""
     B, Q, N, D = 2, 32, 256, 1408
     query_dim = 768
-    
-    attn = QueryPatchAttention(query_dim=query_dim, patch_dim=D)
-    
+
     query_embeds = torch.randn(B, Q, query_dim)
     patch_embeds = torch.randn(B, N, D)
-    
-    attn_weights, attn_importance = attn(query_embeds, patch_embeds)
-    
-    assert attn_weights.shape == (B, Q, N)
-    assert attn_importance.shape == (B, N)
-    # Check attention weights sum to 1 over patches
-    assert torch.allclose(attn_weights.sum(dim=-1), torch.ones(B, Q), atol=1e-5)
-    assert torch.all(attn_importance >= 0)
+
+    for aggregation in ("softmax_sum", "logit_mean"):
+        attn = QueryPatchAttention(query_dim=query_dim, patch_dim=D, aggregation=aggregation)
+        attn_weights, attn_importance = attn(query_embeds, patch_embeds)
+
+        assert attn_weights.shape == (B, Q, N)
+        assert attn_importance.shape == (B, N)
+        # Attention weights are a distribution over patches in both modes
+        assert torch.allclose(attn_weights.sum(dim=-1), torch.ones(B, Q), atol=1e-5)
+
+
+def test_query_patch_attention_importance_sign_convention():
+    """softmax_sum importance is a non-negative mass; logit_mean is signed.
+
+    The legacy mode's non-negativity is exactly what makes its patch-mean
+    constant (each query's mass sums to 1), which is why it cannot be trained
+    by a mean-based loss. See tests/test_gradient_flow.py.
+    """
+    B, Q, N, D = 2, 32, 256, 1408
+    query_embeds = torch.randn(B, Q, 768)
+    patch_embeds = torch.randn(B, N, D)
+
+    legacy = QueryPatchAttention(768, D, aggregation="softmax_sum")
+    _, legacy_importance = legacy(query_embeds, patch_embeds)
+    assert torch.all(legacy_importance >= 0)
+    assert torch.allclose(
+        legacy_importance.sum(dim=1), torch.full((B,), float(Q)), atol=1e-3
+    )
+
+    fixed = QueryPatchAttention(768, D, aggregation="logit_mean")
+    _, fixed_importance = fixed(query_embeds, patch_embeds)
+    assert fixed_importance.std() > 0
 
 
 

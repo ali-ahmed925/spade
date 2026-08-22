@@ -234,6 +234,9 @@ def _load_spade(category: str) -> SPADE:
         mahalanobis_reg=MODEL_CFG["scoring"]["mahalanobis_reg"],
         normal_stats_buffer_size=MODEL_CFG["normal_stats"]["buffer_size"],
         normal_stats_update_frequency=MODEL_CFG["normal_stats"]["update_frequency"],
+        # Scoring-correctness knobs (default to the corrected behaviour)
+        normalize_streams=MODEL_CFG.get("scoring", {}).get("normalize_streams", True),
+        attention_aggregation=MODEL_CFG.get("scoring", {}).get("attention_aggregation", "logit_mean"),
     ).to(_device)
 
     if MODEL_CFG.get("frequency", {}).get("enabled", False):

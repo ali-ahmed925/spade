@@ -27,6 +27,19 @@ scoring:
   mahalanobis_gamma: 1.3                  # Non-linear amplification factor
   mahalanobis_reg: 1e-6                   # Covariance regularization
 
+  # ── Scoring correctness (fix/gradient-correctness branch) ──
+  # normalize_streams: divide each stream by ONE GLOBAL constant (EMA-estimated
+  #   during training, fixed at inference) so alpha/beta/gamma mean what they
+  #   say. Without it the configured 0.25/0.65 split is really ~1e-5 / ~1.
+  #   This is NOT per-image normalization (see EVALUATION_FIX.md).
+  # attention_aggregation: 'logit_mean' (importance responds to the weights) or
+  #   'softmax_sum' (legacy; patch-mean is structurally constant, so mean-based
+  #   losses cannot train it).
+  # Set normalize_streams:false + attention_aggregation:softmax_sum to reproduce
+  # pre-fix checkpoints exactly.
+  normalize_streams: true
+  attention_aggregation: "logit_mean"
+
 # ── Frequency Features (NEW) ──
 frequency:
   enabled: true                           # Enable frequency feature extraction

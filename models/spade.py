@@ -50,17 +50,31 @@ class SPADE(nn.Module):
         # Normal statistics parameters
         normal_stats_buffer_size: int = 10000,
         normal_stats_update_frequency: int = 100,
+        # Scoring correctness: rescale streams so alpha/beta/gamma are meaningful.
+        normalize_streams: bool = True,
+        # The LLM projection has no supervising loss; frozen unless one exists.
+        projection_trainable: bool = False,
+        # 'logit_mean' (default) or 'softmax_sum' (legacy, structurally constant
+        # patch-mean — see QueryPatchAttention docstring).
+        attention_aggregation: str = "logit_mean",
+        # Dependency injection (testing): pass a pre-built BLIP-2-like object to
+        # skip the pretrained download. Must expose .vision_model, .qformer and
+        # .query_tokens. When None (default) the pretrained model is loaded.
+        blip2_model=None,
     ):
         super().__init__()
         
-        # Load pretrained BLIP-2
-        import os
-        token = os.environ.get("HF_TOKEN")
-        blip2 = Blip2Model.from_pretrained(
-            blip2_model_name,
-            token=token,
-            torch_dtype=torch.float16,
-        )
+        # Load pretrained BLIP-2 (unless one was injected)
+        if blip2_model is not None:
+            blip2 = blip2_model
+        else:
+            import os
+            token = os.environ.get("HF_TOKEN")
+            blip2 = Blip2Model.from_pretrained(
+                blip2_model_name,
+                token=token,
+                torch_dtype=torch.float16,
+            )
         
         # Frozen vision encoder
         self.vision_encoder = FrozenVisionEncoder(blip2.vision_model)
@@ -90,6 +104,7 @@ class SPADE(nn.Module):
         self.query_patch_attn = QueryPatchAttention(
             query_dim=qformer_dim,
             patch_dim=vit_dim,
+            aggregation=attention_aggregation,
         )
         
         # Mahalanobis Scoring
@@ -106,11 +121,19 @@ class SPADE(nn.Module):
             update_frequency=normal_stats_update_frequency,
         )
         
-        # LLM Projection
+        # LLM Projection.
+        # NOTE: nothing in the training objective consumes `visual_tokens`, so
+        # these parameters receive no gradient. They are frozen by default so
+        # that "trainable parameters" reports the truth and the optimizer is not
+        # handed tensors it can never update. Set projection_trainable=True only
+        # once a loss actually supervises the text path.
         self.projection = LLMProjection(
             input_dim=qformer_dim,
             output_dim=llm_embed_dim,
         )
+        self.projection_trainable = projection_trainable
+        for p_ in self.projection.parameters():
+            p_.requires_grad = bool(projection_trainable)
         
         # Scoring weights
         self.score_alpha = score_alpha
@@ -119,6 +142,21 @@ class SPADE(nn.Module):
         
         # HPA enabled flag (can be set via enable_hpa/disable_hpa)
         self.use_hpa = True  # Default enabled
+
+        # ── Stream scaling ────────────────────────────────────────────────
+        # The three score streams live on wildly different scales (attention
+        # importance ~1e-3, Mahalanobis ~1e4), so alpha/beta/gamma did not mean
+        # what they claimed: the configured 0.25/0.65 weighting was in reality
+        # ~1e-5 / ~1.0. These buffers hold ONE GLOBAL CONSTANT per stream,
+        # estimated by EMA over training batches, used as a fixed divisor at
+        # inference. They are deliberately NOT per-image: a per-image divisor
+        # would destroy global calibration exactly as EVALUATION_FIX.md warns.
+        self.normalize_streams = normalize_streams
+        self.register_buffer("attn_scale", torch.ones(()))
+        self.register_buffer("mahal_scale", torch.ones(()))
+        self.register_buffer("freq_scale", torch.ones(()))
+        self.register_buffer("stream_scales_initialized", torch.tensor(False))
+        self.stream_scale_momentum = 0.05
         
         # Frequency feature extractor (optional, enabled via enable_frequency_features)
         self.use_frequency = False
@@ -127,11 +165,97 @@ class SPADE(nn.Module):
         self.freq_normal_stats_tracker = None
         self.score_gamma = 0.25  # Default, can be set via enable_frequency_features
         
+    # ──────────────────────────────────────────────────────────────────────
+    # Score composition
+    # ──────────────────────────────────────────────────────────────────────
+    def _update_stream_scales(
+        self,
+        attn: torch.Tensor,
+        mahal: torch.Tensor,
+        freq: torch.Tensor,
+    ) -> None:
+        """EMA-update the global per-stream scale constants (training only)."""
+        m = self.stream_scale_momentum
+        with torch.no_grad():
+            a = attn.detach().abs().mean().clamp_min(1e-8)
+            d = mahal.detach().abs().mean().clamp_min(1e-8)
+            f = freq.detach().abs().mean().clamp_min(1e-8)
+            if not bool(self.stream_scales_initialized):
+                self.attn_scale.fill_(float(a))
+                self.mahal_scale.fill_(float(d))
+                self.freq_scale.fill_(float(f))
+                self.stream_scales_initialized.fill_(True)
+            else:
+                self.attn_scale.mul_(1 - m).add_(m * a)
+                self.mahal_scale.mul_(1 - m).add_(m * d)
+                self.freq_scale.mul_(1 - m).add_(m * f)
+
+    def _compose_scores(
+        self,
+        attn_importance: torch.Tensor,
+        spatial_mahal: torch.Tensor,
+        freq_mahal: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Combine the score streams into per-patch scores.
+
+        Returns both the summed score and the individual *weighted* terms, so
+        callers (and utils/grad_audit.py) can see what each term contributes
+        instead of having to infer it.
+        """
+        attn_norm = attn_importance / (self.qformer.num_queries + 1e-8)
+
+        if self.normalize_streams:
+            attn_norm = attn_norm / self.attn_scale.clamp_min(1e-8)
+            spatial = spatial_mahal / self.mahal_scale.clamp_min(1e-8)
+            frequency = freq_mahal / self.freq_scale.clamp_min(1e-8)
+        else:
+            spatial, frequency = spatial_mahal, freq_mahal
+
+        components = {
+            "attention": self.score_alpha * attn_norm,
+            "spatial_mahalanobis": self.score_beta * spatial,
+            "frequency": self.score_gamma * frequency,
+            "cross": self.score_lambda * (attn_norm * spatial),
+        }
+        patch_scores = (
+            components["attention"]
+            + components["spatial_mahalanobis"]
+            + components["frequency"]
+            + components["cross"]
+        )
+        return patch_scores, components
+
+    def _score_perturbed(
+        self,
+        patch_embeds: torch.Tensor,
+        query_embeds: torch.Tensor,
+        freq_mahal: torch.Tensor,
+        epsilon: float,
+    ) -> torch.Tensor:
+        """Score a noise-perturbed copy of the patch embeddings.
+
+        Used by the pseudo-anomaly objective: a perturbed patch is a cheap
+        stand-in for an anomalous one, and the model should score it HIGHER
+        than the clean patch. The perturbation is applied to the embeddings
+        (which the score genuinely depends on), not to the scores themselves —
+        perturbing the scores, as the original implementation did, cancels
+        algebraically and yields exactly zero gradient.
+        """
+        scale = patch_embeds.detach().std().clamp_min(1e-8)
+        noise = torch.randn_like(patch_embeds) * (epsilon * scale)
+        perturbed = patch_embeds + noise
+
+        _, attn_importance = self.query_patch_attn(query_embeds, perturbed)
+        spatial = self.mahalanobis_scorer(perturbed)
+        scores, _ = self._compose_scores(attn_importance, spatial, freq_mahal)
+        return scores
+
     def forward(
         self,
         images: torch.Tensor,
         patch_labels: torch.Tensor | None = None,
         update_stats: bool = False,
+        perturb_epsilon: float | None = None,
     ) -> dict[str, torch.Tensor]:
         # ⚠️ CRITICAL: Log training mode and HPA status
         _debug_logger.debug(f"[SPADE DEBUG] Forward pass - training={self.training}, use_hpa={self.use_hpa}")
@@ -170,10 +294,12 @@ class SPADE(nn.Module):
         # 3. Update normal statistics if training
         if update_stats and patch_labels is not None:
             self.normal_stats_tracker.add_normal_patches(patch_embeds, patch_labels)
-            # Periodically update Mahalanobis statistics
+            # Periodically update Mahalanobis statistics.
+            # NOTE: get_statistics() used to be called here and its (D x D)
+            # covariance thrown away — update_statistics() recomputes both mu
+            # and sigma from the same buffer. Only the emptiness check is needed.
             if self.normal_stats_tracker.step_count % self.normal_stats_tracker.update_frequency == 0:
-                mu, sigma = self.normal_stats_tracker.get_statistics()
-                if mu is not None:
+                if len(self.normal_stats_tracker.normal_patch_buffer) > 0:
                     normal_patches = torch.stack(list(self.normal_stats_tracker.normal_patch_buffer))
                     # Move to same device as model
                     normal_patches = normal_patches.to(patch_embeds.device)
@@ -210,8 +336,7 @@ class SPADE(nn.Module):
             if update_stats and patch_labels is not None:
                 self.freq_normal_stats_tracker.add_normal_patches(freq_features, patch_labels)
                 if self.freq_normal_stats_tracker.step_count % self.freq_normal_stats_tracker.update_frequency == 0:
-                    mu, sigma = self.freq_normal_stats_tracker.get_statistics()
-                    if mu is not None:
+                    if len(self.freq_normal_stats_tracker.normal_patch_buffer) > 0:
                         normal_freq = torch.stack(list(self.freq_normal_stats_tracker.normal_patch_buffer))
                         normal_freq = normal_freq.to(freq_features.device)
                         self.freq_mahalanobis_scorer.update_statistics(normal_freq)
@@ -345,19 +470,21 @@ class SPADE(nn.Module):
             _debug_logger.debug(f"[SPADE DEBUG] Final frequency Mahalanobis - RAW: mean={freq_mean:.4f}, "
                   f"std={freq_std:.4f}, max={freq_max:.4f}, min={freq_min:.4f}")
         
-        # Final patch scores with cross-term
-        # Normalize attention importance to [0, 1] range to prevent extreme values
-        # Attention importance can be very high initially (sum over queries, each in [0,1])
-        # With 32 queries, max attention_importance = 32, which is too high
-        attn_importance_norm = final_attn_importance / (self.qformer.num_queries + 1e-8)  # Normalize by num queries
-        
-        # ⭐ COMBINED FINAL SCORES (spatial + frequency) - Using RAW Mahalanobis scores
-        patch_scores = (
-            self.score_alpha * attn_importance_norm +
-            self.score_beta * final_spatial_mahal +
-            self.score_gamma * final_freq_mahal +
-            self.score_lambda * (attn_importance_norm * final_spatial_mahal)
+        # Final patch scores with cross-term.
+        # Stream scales are refreshed only while training statistics are being
+        # updated, so inference uses fixed global constants (no per-image
+        # normalization — see EVALUATION_FIX.md).
+        if self.training and update_stats:
+            self._update_stream_scales(
+                final_attn_importance / (self.qformer.num_queries + 1e-8),
+                final_spatial_mahal,
+                final_freq_mahal,
+            )
+
+        patch_scores, score_components = self._compose_scores(
+            final_attn_importance, final_spatial_mahal, final_freq_mahal
         )  # (B, N)
+        attn_importance_norm = final_attn_importance / (self.qformer.num_queries + 1e-8)
         
         # DEBUG: Final patch scores statistics
         patch_mean = patch_scores.mean().item()
@@ -449,11 +576,24 @@ class SPADE(nn.Module):
         # 6. Project for LLM (use initial query embeds for consistency)
         visual_tokens = self.projection(initial_query_embeds)
         
-        return {
+        outputs = {
             "patch_scores": patch_scores,
             "query_embeds": initial_query_embeds,  # Return initial queries
             "visual_tokens": visual_tokens,
+            "score_components": score_components,
         }
+
+        # Pseudo-anomaly branch: score a perturbed copy of the same patches so
+        # the loss has a real contrastive signal (see _score_perturbed).
+        if perturb_epsilon is not None:
+            query_for_perturb = (
+                final_refined_queries if self.use_hpa else initial_query_embeds
+            )
+            outputs["patch_scores_perturbed"] = self._score_perturbed(
+                patch_embeds, query_for_perturb, final_freq_mahal, perturb_epsilon
+            )
+
+        return outputs
     
     def get_image_score(self, patch_scores: torch.Tensor) -> torch.Tensor:
         """Aggregate patch scores into image-level score using top-3 mean.

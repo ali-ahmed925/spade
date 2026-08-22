@@ -71,11 +71,17 @@ def train_one_epoch(
         patch_labels = batch["patch_labels"].to(device)   # (B, N)
         labels = batch["label"].to(device).long()        # (B,) 0=clean, 1=synthetic anomaly
 
-        # Forward with patch_labels for statistics update
+        # Forward with patch_labels for statistics update.
+        # perturb_epsilon makes the model score a perturbed copy of the patches
+        # so the pseudo-anomaly loss has a real (non-cancelling) gradient.
+        perturb_epsilon = None
+        if criterion.pseudo_loss_fn is not None:
+            perturb_epsilon = criterion.pseudo_loss_fn.epsilon
         outputs = model(
             images,
             patch_labels=patch_labels,
             update_stats=True,  # Update normal statistics during training
+            perturb_epsilon=perturb_epsilon,
         )
         
         # ⚠️ CRITICAL: Verify HPA is actually affecting patch scores during training
@@ -101,11 +107,30 @@ def train_one_epoch(
             patch_targets=patch_labels,  # All zeros for normal-only training
             query_embeds=outputs["query_embeds"],
             labels=labels,  # All zeros for normal-only training
+            patch_scores_perturbed=outputs.get("patch_scores_perturbed"),
         )
 
         # Backward
         optimizer.zero_grad()
         losses["total"].backward()
+
+        # ── Gradient self-check (first step only) ──────────────────────────
+        # Fails loudly if any parameter we call "trainable" received no signal.
+        # A silent dead path here is how the projection head went a whole
+        # project without ever being trained.
+        if step == 0 and epoch == 1:
+            from utils.grad_audit import classify_parameters, dead_parameters, format_report
+            report = classify_parameters(model)
+            dead = dead_parameters(report)
+            logger.info("\n" + format_report(report))
+            if dead:
+                raise RuntimeError(
+                    f"{len(dead)} trainable parameter tensor(s) received no gradient: "
+                    f"{dead[:5]}{'...' if len(dead) > 5 else ''}. "
+                    "Either connect them to the loss or freeze them "
+                    "(see utils/grad_audit.py)."
+                )
+
         grad_norm = clip_gradients(model, cfg["training"]["gradient_clip"])
         optimizer.step()
         scheduler.step()
@@ -370,6 +395,9 @@ def main() -> None:
         # Normal statistics parameters
         normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
         normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
+        # Scoring-correctness knobs (default to the corrected behaviour)
+        normalize_streams=cfg.get("scoring", {}).get("normalize_streams", True),
+        attention_aggregation=cfg.get("scoring", {}).get("attention_aggregation", "logit_mean"),
     ).to(device)
 
     # Enable/disable HPA based on config
@@ -451,6 +479,7 @@ def main() -> None:
             var_weight=loss_cfg.get("var_weight", 0.1),
             use_pseudo=loss_cfg.get("use_pseudo", False),
             pseudo_epsilon=loss_cfg.get("pseudo_epsilon", 0.01),
+            pseudo_margin=loss_cfg.get("pseudo_margin", 0.1),
             clamp_max=loss_cfg.get("clamp_max", 100.0),
         )
         logger.info(
@@ -585,9 +614,14 @@ def main() -> None:
                     best_val_patch_auroc = current_patch
                     best_epoch = epoch
 
+                    # Save everything except the frozen backbone, which is
+                    # restored from the BLIP-2 download. The previous allowlist
+                    # silently dropped any state added later (e.g. the stream
+                    # scale buffers), producing checkpoints that could not
+                    # reproduce their own scores.
                     trainable_state = {
                         k: v for k, v in model.state_dict().items()
-                        if any(k.startswith(prefix) for prefix in ["qformer.", "projection.", "hpa.", "query_patch_attn.", "mahalanobis_scorer.", "normal_stats_tracker."])
+                        if not k.startswith("vision_encoder.")
                     }
 
                     best_path = os.path.join(checkpoint_dir, "spade_best.pt")

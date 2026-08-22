@@ -249,10 +249,31 @@ class HybridPatchAnnealing(nn.Module):
 
 
 class QueryPatchAttention(nn.Module):
-    """Query-to-patch attention for computing attention importance."""
-    
-    def __init__(self, query_dim: int, patch_dim: int):
+    """Query-to-patch attention for computing attention importance.
+
+    Aggregation modes
+    -----------------
+    ``softmax_sum`` (legacy): importance = sum over queries of softmax weights.
+        Because each query's softmax sums to 1 over patches, the sum over
+        queries is ALWAYS exactly ``num_queries``, so the patch-mean of the
+        importance map is the constant ``num_queries / num_patches`` for every
+        image and every parameter setting. Any loss term acting on the *mean*
+        of a score built from this is mathematically blind to these weights;
+        only the *shape* can be learned, and a variance-minimizing term drives
+        that shape toward uniform (i.e. erases it).
+
+    ``logit_mean`` (default): importance = mean over queries of the raw scaled
+        dot-product logits. Unnormalized, so both the mean and the shape
+        respond to the parameters and the loss can act on them.
+    """
+
+    def __init__(self, query_dim: int, patch_dim: int, aggregation: str = "logit_mean"):
         super().__init__()
+        if aggregation not in ("logit_mean", "softmax_sum"):
+            raise ValueError(
+                f"aggregation must be 'logit_mean' or 'softmax_sum', got {aggregation!r}"
+            )
+        self.aggregation = aggregation
         self.query_proj = nn.Linear(query_dim, patch_dim)
         self.scale = patch_dim ** -0.5
         
@@ -278,9 +299,13 @@ class QueryPatchAttention(nn.Module):
         # Compute attention
         attn_scores = torch.bmm(queries, patch_embeds.transpose(1, 2)) * self.scale
         attn_weights = F.softmax(attn_scores, dim=-1)  # (B, Q, N)
-        
-        # Aggregate importance: sum over queries
-        attention_importance = attn_weights.sum(dim=1)  # (B, N)
-        
+
+        if self.aggregation == "softmax_sum":
+            # Legacy: patch-mean is structurally constant (see class docstring).
+            attention_importance = attn_weights.sum(dim=1)  # (B, N)
+        else:
+            # Unnormalized importance: responds to the projection weights.
+            attention_importance = attn_scores.mean(dim=1)  # (B, N)
+
         return attn_weights, attention_importance
 

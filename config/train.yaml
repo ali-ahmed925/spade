@@ -41,7 +41,8 @@ loss:
   # Normal-only training parameters (when synthetic.enabled=false)
   var_weight: 0.1              # Weight for variance term in Mahalanobis loss (encourages tight clustering)
   use_pseudo: true           # Use pseudo-anomaly loss for contrastive learning
-  pseudo_epsilon: 0.01       # Perturbation magnitude for pseudo-anomaly loss
+  pseudo_epsilon: 0.01       # Perturbation magnitude (applied to EMBEDDINGS)
+  pseudo_margin: 0.1         # Perturbed patches must score this much higher
   clamp_max: 100.0            # Maximum score for soft clipping
 
 
