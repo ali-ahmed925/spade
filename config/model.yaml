@@ -40,6 +40,12 @@ scoring:
   normalize_streams: true
   attention_aggregation: "logit_mean"
 
+  # Gaussian sigma applied to the anomaly map before metrics. PaDiM/PatchCore/
+  # SingleNet all smooth (~4 at 224px); this pipeline did not, which costs pixel
+  # AUROC and confounds any resolution experiment. Must be identical across both
+  # arms of any comparison. 0 reproduces the pre-fix behaviour.
+  smooth_sigma: 4.0
+
 # ── Frequency Features (NEW) ──
 frequency:
   enabled: true                           # Enable frequency feature extraction

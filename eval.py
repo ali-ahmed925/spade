@@ -24,7 +24,15 @@ from data.mvtec_dataset import MVTecDataset
 from models.spade import SPADE
 from utils.heatmap import patches_to_heatmap, overlay_heatmap, save_heatmap
 from utils.logging import get_logger
-from utils.metrics import compute_image_auroc, compute_pixel_auroc
+from utils.metrics import compute_image_auroc, compute_pixel_auroc, compute_pro
+from models.tiling import (
+    crops_from_image,
+    fine_statistics,
+    image_score_from_map,
+    stitch_tile_scores,
+    tile_boxes,
+)
+from utils.heatmap import smooth_map
 
 
 def load_config() -> dict:
@@ -85,6 +93,54 @@ def save_localization_visualization(
 
 
 @torch.no_grad()
+
+@torch.no_grad()
+def _dense_tiling_map(
+    model: SPADE,
+    image_path: str,
+    tiling: dict,
+    image_size: int,
+    device: torch.device,
+    smooth_sigma: float = 0.0,
+) -> np.ndarray:
+    """Score one image by dense overlapping tiles of the NATIVE-resolution file.
+
+    This is the Phase 1 ceiling test: the upper bound on what any adaptive
+    refinement scheme could achieve, since it refines everywhere.
+
+    The model, weights and score composition are identical to the coarse path —
+    only the input scale and the (scale-matched) Mahalanobis statistics change,
+    so the comparison isolates resolution.
+    """
+    from PIL import Image as PILImage
+
+    image_bgr = cv2.imread(image_path)
+    if image_bgr is None:
+        raise ValueError(f"cannot read {image_path}")
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    native = image_rgb.shape[0]
+
+    boxes = tile_boxes(native, grid=tiling["grid"], overlap=tiling["overlap"])
+    crops = crops_from_image(image_rgb, boxes, out_size=image_size)
+    batch = torch.stack(
+        [tiling["transform"](PILImage.fromarray(c)) for c in crops]
+    ).to(device)
+
+    # fine_statistics validates the incoming statistics on entry; checking the
+    # scorer inside the context would be useless, since the swap sets
+    # is_initialized=True regardless of whether the stats were ever fitted.
+    # fine_statistics validates the incoming statistics on entry — checking the
+    # scorer inside the block would be useless, since the swap has by then set
+    # is_initialized=True regardless of whether the stats were ever fitted.
+    with fine_statistics(model, tiling["stats"]):
+        outputs = model(batch)
+        tile_scores = outputs["patch_scores"]
+
+    fused = stitch_tile_scores(tile_scores, boxes, native_size=native, canvas_size=image_size)
+    return smooth_map(fused, smooth_sigma)
+
+
+@torch.no_grad()
 def evaluate(
     model: SPADE,
     loader: DataLoader,
@@ -93,6 +149,8 @@ def evaluate(
     patch_size: int,
     save_dir: str | None = None,
     save_visualizations: bool = False,
+    smooth_sigma: float = 0.0,
+    tiling: dict | None = None,
 ) -> dict[str, float]:
     """Run evaluation on the test set.
 
@@ -145,13 +203,31 @@ def evaluate(
             # CRITICAL: Use RAW scores for pixel AUROC computation (no per-image normalization)
             # Per-image normalization artificially inflates pixel AUROC by stretching each
             # image's score distribution independently, removing global calibration.
+            # Gaussian smoothing IS applied here (it is a fixed, image-independent
+            # filter, so it does not leak calibration) because every comparable
+            # method smooths, and because an unsmoothed baseline would confound
+            # any resolution experiment.
             patch_scores_raw = patch_scores[i].detach().cpu()
-            hmap_raw = patches_to_heatmap(
-                patch_scores_raw,
-                image_size=image_size,
-                patch_size=patch_size,
-                normalize=False,  # NO normalization for metric computation
-            )
+            if tiling is not None:
+                hmap_raw = _dense_tiling_map(
+                    model=model,
+                    image_path=paths[i] if isinstance(paths, (list, tuple)) else paths,
+                    tiling=tiling,
+                    image_size=image_size,
+                    device=device,
+                    smooth_sigma=smooth_sigma,
+                )
+                # Image score must come from the same fused evidence
+                all_image_scores[-1] = image_score_from_map(hmap_raw)
+                all_image_info[-1]["score"] = all_image_scores[-1]
+            else:
+                hmap_raw = patches_to_heatmap(
+                    patch_scores_raw,
+                    image_size=image_size,
+                    patch_size=patch_size,
+                    normalize=False,  # NO normalization for metric computation
+                    smooth_sigma=smooth_sigma,
+                )
             all_heatmaps.append(hmap_raw)
             
             # For visualization: create normalized version (only if saving)
@@ -229,8 +305,12 @@ def evaluate(
 
     if masks_arr.max() > 0:
         results["pixel_auroc"] = compute_pixel_auroc(masks_arr, heatmaps_arr)
+        # PRO weights every defect region equally, so a method that only finds
+        # large defects cannot hide behind a good pixel AUROC.
+        results["pro"] = compute_pro(masks_arr, heatmaps_arr)
     else:
         results["pixel_auroc"] = float("nan")
+        results["pro"] = float("nan")
     
     # ── Print detailed image scores ──
     print("\n" + "=" * 80)
@@ -348,6 +428,28 @@ def main() -> None:
     parser.add_argument("--save_visualizations", action="store_true", help="Save full localization visualizations (image + GT + heatmap + overlay)")
     parser.add_argument("--log_wandb", action="store_true", help="Log results to wandb")
     parser.add_argument("--wandb_run_id", type=str, default=None, help="Wandb run ID to log to (if resuming)")
+    parser.add_argument(
+        "--split", type=str, default="all", choices=["all", "val", "heldout"],
+        help="Which half of the test set to score. 'val' is the half used for "
+             "checkpoint selection during training (optimistic); 'heldout' is the "
+             "half never seen by model selection (the honest number); 'all' is both.",
+    )
+    parser.add_argument(
+        "--smooth-sigma", type=float, default=None,
+        help="Gaussian sigma applied to the anomaly map before metrics. Defaults "
+             "to config scoring.smooth_sigma. Comparable methods use ~4 at 224px.",
+    )
+    parser.add_argument(
+        "--dense-tiling", action="store_true",
+        help="Phase 1 ceiling test: score NxN overlapping crops of the native-"
+             "resolution image and fuse. Requires fine-scale statistics.",
+    )
+    parser.add_argument("--grid", type=int, default=3, help="Tiles per axis for --dense-tiling")
+    parser.add_argument("--overlap", type=float, default=0.5, help="Tile overlap for --dense-tiling")
+    parser.add_argument(
+        "--fine-stats", type=str, default=None,
+        help="Path to fine-scale statistics (default: checkpoints/<cat>/fine_stats_g<grid>_o<overlap>.pt)",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -378,6 +480,30 @@ def main() -> None:
         logger.info("Logging evaluation to Weights & Biases")
 
     # ── Dataset ──
+    # train.py splits the test set 50/50 with seed 42 and uses the first half for
+    # validation, i.e. for early stopping and "best checkpoint" decisions. Scoring
+    # that same half reports a number the checkpoint was selected on. --split
+    # heldout reproduces the complement, which is the honest figure to publish.
+    subset_indices = None
+    if args.split != "all":
+        probe = MVTecDataset(
+            root=cfg["dataset"]["root"],
+            category=cfg["dataset"]["category"],
+            split="test",
+            image_size=cfg["vit"]["image_size"],
+            patch_size=cfg["vit"]["patch_size"],
+            synthetic_method=None,
+        )
+        n_test = len(probe)
+        val_size = n_test // 2
+        seed = int(cfg.get("validation", {}).get("seed", 42))
+        perm = np.random.RandomState(seed).permutation(n_test).tolist()
+        subset_indices = perm[:val_size] if args.split == "val" else perm[val_size:]
+        logger.info(
+            f"split={args.split}: {len(subset_indices)} of {n_test} test images "
+            f"(seed {seed}, matching train.py)"
+        )
+
     dataset = MVTecDataset(
         root=cfg["dataset"]["root"],
         category=cfg["dataset"]["category"],
@@ -385,6 +511,7 @@ def main() -> None:
         image_size=cfg["vit"]["image_size"],
         patch_size=cfg["vit"]["patch_size"],
         synthetic_method=None,
+        subset_indices=subset_indices,
     )
     loader = DataLoader(
         dataset,
@@ -503,21 +630,73 @@ def main() -> None:
         return
 
     # ── Evaluate ──
+    # ── Smoothing (applies to BOTH arms of any comparison) ──
+    smooth_sigma = (
+        args.smooth_sigma
+        if args.smooth_sigma is not None
+        else float(cfg.get("scoring", {}).get("smooth_sigma", 0.0))
+    )
+    logger.info(f"anomaly-map smoothing sigma = {smooth_sigma}")
+
+    # ── Dense tiling (Phase 1 ceiling test) ──
+    tiling = None
+    if args.dense_tiling:
+        from data.transforms import get_eval_transforms
+
+        stats_path = args.fine_stats or (
+            f"checkpoints/{category}/fine_stats_g{args.grid}_o{args.overlap}.pt"
+        )
+        if not os.path.exists(stats_path):
+            raise FileNotFoundError(
+                f"fine-scale statistics not found: {stats_path}\n"
+                f"Run: python scripts/fit_fine_statistics.py --category {category} "
+                f"--grid {args.grid} --overlap {args.overlap}\n"
+                "Whole-image statistics do NOT transfer to zoomed crops — scoring "
+                "tiles without them produces meaningless distances."
+            )
+        stats = torch.load(stats_path, map_location="cpu", weights_only=False)
+        meta = stats.get("meta", {})
+        if meta.get("grid") != args.grid or meta.get("overlap") != args.overlap:
+            logger.warning(
+                f"fine statistics were fitted at grid={meta.get('grid')} "
+                f"overlap={meta.get('overlap')} but you are evaluating at "
+                f"grid={args.grid} overlap={args.overlap} — scale mismatch"
+            )
+        tiling = {
+            "grid": args.grid,
+            "overlap": args.overlap,
+            "stats": stats,
+            "transform": get_eval_transforms(cfg["vit"]["image_size"]),
+        }
+        logger.info(
+            f"DENSE TILING: {args.grid}x{args.grid} tiles, overlap {args.overlap}, "
+            f"stats from {stats_path} ({stats['spatial']['n_patches']} patches)"
+        )
+
     results = evaluate(
         model, loader, device,
         image_size=cfg["vit"]["image_size"],
         patch_size=cfg["vit"]["patch_size"],
         save_dir=save_dir,
         save_visualizations=args.save_visualizations,
+        smooth_sigma=smooth_sigma,
+        tiling=tiling,
     )
     logger.info(f"Image AUROC: {results['image_auroc']:.4f}")
     logger.info(f"Pixel AUROC: {results['pixel_auroc']:.4f}")
+    logger.info(f"PRO       : {results.get('pro', float('nan')):.4f}")
+    logger.info(
+        f"[config] split={args.split} smooth_sigma={smooth_sigma} "
+        f"dense_tiling={bool(tiling)}"
+        + (f" grid={args.grid} overlap={args.overlap}" if tiling else "")
+    )
 
     # ── Log to wandb ──
     if args.log_wandb:
         wandb.log({
             "eval/image_auroc": results["image_auroc"],
             "eval/pixel_auroc": results["pixel_auroc"],
+            "eval/pro": results.get("pro", float("nan")),
             "eval/checkpoint": args.checkpoint,
             "eval/checkpoint_epoch": checkpoint_epoch,
         })

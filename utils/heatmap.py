@@ -8,12 +8,40 @@ import numpy as np
 import torch
 
 
+def smooth_map(hmap: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian-smooth an anomaly map.
+
+    Every comparable method smooths its anomaly map before scoring (PaDiM,
+    PatchCore, and the WACV SingleNet reference all use a Gaussian with sigma=4
+    at 224-256 px). This pipeline did not, which both costs pixel AUROC and —
+    more importantly — confounds any experiment that changes map resolution:
+    a resolution gain and a smoothing gain are indistinguishable unless both
+    arms are smoothed identically.
+
+    Smoothing is a fixed, image-independent linear filter, so unlike per-image
+    percentile normalization it does NOT leak calibration across images and is
+    safe to use on the metric path (see EVALUATION_FIX.md).
+
+    Args:
+        hmap: (H, W) score map.
+        sigma: Gaussian sigma in pixels. <= 0 disables smoothing.
+
+    Returns:
+        (H, W) smoothed map, same dtype/scale as the input.
+    """
+    if sigma is None or sigma <= 0:
+        return hmap
+    # ksize=0 lets OpenCV derive the kernel size from sigma
+    return cv2.GaussianBlur(hmap, (0, 0), sigmaX=float(sigma), sigmaY=float(sigma))
+
+
 def patches_to_heatmap(
     patch_scores: torch.Tensor,
     image_size: int = 224,
     patch_size: int = 14,
     percentile_clip: tuple[float, float] = (5.0, 95.0),
     normalize: bool = True,
+    smooth_sigma: float = 0.0,
 ) -> np.ndarray:
     """Reshape flat patch scores into a 2-D heatmap and upsample.
 
@@ -24,6 +52,8 @@ def patches_to_heatmap(
         percentile_clip: (low, high) percentiles for robust normalization.
         normalize: If True, normalize to [0, 1] using percentiles. If False, return raw scores.
                   Set to False for metric computation (pixel AUROC), True for visualization.
+        smooth_sigma: Gaussian sigma applied AFTER upsampling and BEFORE any
+                  normalization, so it is part of the metric path. 0 disables.
 
     Returns:
         (image_size, image_size) numpy heatmap.
@@ -34,6 +64,9 @@ def patches_to_heatmap(
     hmap = patch_scores.detach().cpu().float().reshape(grid, grid).numpy()
     # Bilinear upsample to image resolution
     hmap = cv2.resize(hmap, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+
+    # Smooth on the raw scale — before normalization, so metrics see it too.
+    hmap = smooth_map(hmap, smooth_sigma)
     
     if normalize:
         # Robust normalization using percentiles to handle outliers
