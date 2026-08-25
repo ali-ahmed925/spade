@@ -307,7 +307,13 @@ def evaluate(
         results["pixel_auroc"] = compute_pixel_auroc(masks_arr, heatmaps_arr)
         # PRO weights every defect region equally, so a method that only finds
         # large defects cannot hide behind a good pixel AUROC.
-        results["pro"] = compute_pro(masks_arr, heatmaps_arr)
+        # It is a secondary metric: a failure here must not discard an entire
+        # evaluation run, so it is reported as nan with the cause surfaced.
+        try:
+            results["pro"] = compute_pro(masks_arr, heatmaps_arr)
+        except Exception as exc:  # noqa: BLE001 - report, do not lose the run
+            print(f"[warn] PRO computation failed ({type(exc).__name__}: {exc}); reporting nan")
+            results["pro"] = float("nan")
     else:
         results["pixel_auroc"] = float("nan")
         results["pro"] = float("nan")

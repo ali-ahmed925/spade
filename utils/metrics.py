@@ -145,5 +145,7 @@ def compute_pro(
     # since PRO is non-decreasing in FPR.
     grid = np.linspace(0.0, max_fpr, 256)
     pro_on_grid = np.interp(grid, fprs_arr, pros_arr)
-    trapz = getattr(np, "trapezoid", np.trapz)  # numpy>=2 renamed trapz
+    # numpy 2 renamed trapz -> trapezoid and REMOVED trapz, so getattr with a
+    # np.trapz default would raise while evaluating the default argument.
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return float(trapz(pro_on_grid, grid) / max_fpr)

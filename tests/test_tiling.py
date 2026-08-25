@@ -142,3 +142,22 @@ def test_require_fine_stats_raises_on_uninitialized_scorer():
 
     scorer.update_statistics(torch.randn(64, 8))
     require_fine_stats(scorer)  # must not raise once fitted
+
+
+# ── Metric regression ────────────────────────────────────────────────────────
+def test_compute_pro_works_without_numpy_trapz(monkeypatch):
+    """numpy 2 removed np.trapz; PRO must not reference it eagerly.
+
+    The first version used getattr(np, "trapezoid", np.trapz), whose default
+    argument is evaluated immediately and raised AttributeError on numpy 2.
+    """
+    import numpy as np
+
+    from utils.metrics import compute_pro
+
+    monkeypatch.delattr(np, "trapz", raising=False)
+
+    masks = np.zeros((2, 32, 32), dtype=np.uint8)
+    masks[0, 8:16, 8:16] = 1
+    scores = masks.astype(float) + np.random.default_rng(0).normal(0, 0.01, masks.shape)
+    assert compute_pro(masks, scores) == pytest.approx(1.0, abs=0.05)
