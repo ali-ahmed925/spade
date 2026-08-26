@@ -39,7 +39,7 @@ pytest tests/test_mahalanobis_scoring.py::test_mahalanobis_forward   # single te
 
 Two independent config layers — do not confuse them:
 
-- `config/*.yaml` — the pipeline. Each entry point has its **own** `load_config()` that merges a different subset into one flat dict: `train.py` and `eval.py` merge `model + data + train`; `infer.py` merges `model + data + llm`. Top-level keys are flattened, so a key added to two files silently overwrites. Adding a config key that a script needs means checking that script's own tuple.
+- `config/*.yaml` — the pipeline. Each entry point has its **own** `load_config()` that merges a different subset into one flat dict: `train.py` and `eval.py` merge `model + data + train`; `infer.py` merges `model + data + llm + train` (the last for `training.checkpoint_dir`). Top-level keys are flattened, so a key added to two files silently overwrites. Adding a config key that a script needs means checking that script's own tuple.
 - `config.yaml` (repo root) — the demo app only. Holds `dataset_root`, `checkpoints_root`, per-category curated image lists, per-category verdict `thresholds`, and display-only `hyperparameters`. The `hyperparameters` block is a UI label set and can drift from `config/model.yaml` — `config/model.yaml` is the truth for anything that affects computation.
 
 Nothing is hard-coded in the training scripts; all hyperparameters live in these files.

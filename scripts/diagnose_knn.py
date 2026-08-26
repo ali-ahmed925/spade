@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.mvtec_dataset import MVTecDataset  # noqa: E402
 from data.transforms import get_eval_transforms  # noqa: E402
 from eval import load_config  # noqa: E402
+from models.builder import checkpoint_path  # noqa: E402
 from scripts.fit_fine_statistics import build_model  # noqa: E402
 from utils.heatmap import patches_to_heatmap  # noqa: E402
 from utils.logging import get_logger  # noqa: E402
@@ -157,7 +158,7 @@ def main() -> None:
     cfg["dataset"]["category"] = args.category
     logger = get_logger("D2")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = args.checkpoint or f"checkpoints/{args.category}/spade_best.pt"
+    checkpoint = args.checkpoint or checkpoint_path(cfg, args.category)
     image_size, patch_size = cfg["vit"]["image_size"], cfg["vit"]["patch_size"]
 
     train_dir = Path(cfg["dataset"]["root"]) / args.category / "train" / "good"

@@ -15,6 +15,23 @@ from models.spade import SPADE
 from utils.checkpoint import load_checkpoint_into
 
 
+def checkpoint_root(cfg: dict) -> str:
+    """Directory holding per-category checkpoints, from training.checkpoint_dir.
+
+    Single source of truth so a change to that config key reaches every entry
+    point and script at once. Falls back to ./checkpoints when the training
+    config is not part of the merged dict (infer.py merges model+data+llm).
+    """
+    return cfg.get("training", {}).get("checkpoint_dir", "./checkpoints")
+
+
+def checkpoint_path(cfg: dict, category: str, filename: str = "spade_best.pt") -> str:
+    """Path to one category's checkpoint or a sidecar next to it."""
+    import os
+
+    return os.path.join(checkpoint_root(cfg), category, filename)
+
+
 def build_spade(cfg: dict, device: torch.device | str = "cpu", blip2_model=None) -> SPADE:
     """Construct SPADE from a merged config dict (model + data + train/llm)."""
     vit = cfg["vit"]

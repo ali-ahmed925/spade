@@ -21,7 +21,7 @@ import wandb
 import matplotlib.pyplot as plt
 
 from data.mvtec_dataset import MVTecDataset
-from models.builder import describe, load_spade
+from models.builder import checkpoint_path, describe, load_spade
 from models.spade import SPADE
 from utils.heatmap import patches_to_heatmap, overlay_heatmap, save_heatmap
 from utils.logging import get_logger
@@ -555,7 +555,7 @@ def main() -> None:
     if args.positional:
         from models.positional_mahalanobis import build_positional_scorer
 
-        pstats_path = args.positional_stats or f"checkpoints/{category}/positional_stats.pt"
+        pstats_path = args.positional_stats or checkpoint_path(cfg, category, "positional_stats.pt")
         if not os.path.exists(pstats_path):
             raise FileNotFoundError(
                 f"positional statistics not found: {pstats_path}\n"
@@ -593,8 +593,8 @@ def main() -> None:
     if args.dense_tiling:
         from data.transforms import get_eval_transforms
 
-        stats_path = args.fine_stats or (
-            f"checkpoints/{category}/fine_stats_g{args.grid}_o{args.overlap}.pt"
+        stats_path = args.fine_stats or checkpoint_path(
+            cfg, category, f"fine_stats_g{args.grid}_o{args.overlap}.pt"
         )
         if not os.path.exists(stats_path):
             raise FileNotFoundError(

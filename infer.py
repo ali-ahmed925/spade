@@ -28,7 +28,9 @@ from utils.logging import get_logger
 def load_config() -> dict:
     cfg = {}
     config_dir = os.path.join(os.path.dirname(__file__), "config")
-    for name in ("model", "data", "llm"):
+    # "train" is included for training.checkpoint_dir so checkpoint paths resolve
+    # identically here and in train.py/eval.py; its other keys are unused.
+    for name in ("model", "data", "llm", "train"):
         with open(os.path.join(config_dir, f"{name}.yaml")) as f:
             cfg.update(yaml.safe_load(f))
     return cfg

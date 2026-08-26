@@ -10,7 +10,12 @@ training:
   seed: 42
   log_interval: 10                        # steps between log prints
   save_interval: 5                        # epochs between checkpoint saves
-  checkpoint_dir: "./checkpoints"
+  # Checkpoints from the feature-space redesign land here, leaving ./checkpoints
+  # (the pre-redesign models) untouched. Those cannot be loaded by the current
+  # model anyway — the descriptor space changed from 1408-d raw ViT patches to
+  # 512-d contextual descriptors, and the patch grid from 256 to 1024 — so they
+  # are kept for reference, not reuse.
+  checkpoint_dir: "./checkpoints_v2"
   early_stopping:
     enabled: true
     patience: 10                          # epochs to wait before stopping

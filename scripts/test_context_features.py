@@ -58,6 +58,7 @@ from data.mvtec_dataset import MVTecDataset  # noqa: E402
 from data.transforms import get_eval_transforms  # noqa: E402
 from eval import load_config  # noqa: E402
 from scripts.diagnose_failure import mask_to_patch_grid, split_indices  # noqa: E402
+from models.builder import checkpoint_path  # noqa: E402
 from scripts.fit_fine_statistics import build_model  # noqa: E402
 from sklearn.metrics import roc_auc_score  # noqa: E402
 from utils.logging import get_logger  # noqa: E402
@@ -192,7 +193,7 @@ def main() -> None:
     cfg["dataset"]["category"] = args.category
     logger = get_logger("D5")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = args.checkpoint or f"checkpoints/{args.category}/spade_best.pt"
+    checkpoint = args.checkpoint or checkpoint_path(cfg, args.category)
     image_size, patch_size = cfg["vit"]["image_size"], cfg["vit"]["patch_size"]
     grid = image_size // patch_size
 

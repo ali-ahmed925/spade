@@ -43,7 +43,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.transforms import get_eval_transforms  # noqa: E402
-from models.builder import load_spade  # noqa: E402
+from models.builder import checkpoint_path, load_spade  # noqa: E402
 from models.spade import SPADE  # noqa: E402
 from models.tiling import crops_from_image, tile_boxes  # noqa: E402
 from utils.logging import get_logger  # noqa: E402
@@ -193,7 +193,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     category = args.category or cfg["dataset"]["category"]
-    checkpoint = args.checkpoint or f"checkpoints/{category}/spade_best.pt"
+    checkpoint = args.checkpoint or checkpoint_path(cfg, category)
     image_size = cfg["vit"]["image_size"]
 
     train_dir = Path(cfg["dataset"]["root"]) / category / "train" / "good"
@@ -227,7 +227,7 @@ def main() -> None:
         "n_train_images": len(image_paths),
     }
 
-    out = args.output or f"checkpoints/{category}/fine_stats_g{args.grid}_o{args.overlap}.pt"
+    out = args.output or checkpoint_path(cfg, category, f"fine_stats_g{args.grid}_o{args.overlap}.pt")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     torch.save(stats, out)
     logger.info(f"saved fine statistics -> {out}")
