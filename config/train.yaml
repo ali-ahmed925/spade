@@ -1,7 +1,8 @@
 # ── Training ──
 training:
   epochs: 20
-  batch_size: 8  # Reduced for hierarchical refinement (multiple Q-Former passes)
+  batch_size: 2  # 448x448 input = 1025 tokens through ViT-G; self-attention cost
+                 # is ~16x the 224 setting, so the batch is reduced accordingly.
   learning_rate: 1.0e-4
   weight_decay: 1.0e-4
   warmup_epochs: 5

@@ -19,6 +19,7 @@ import yaml
 from PIL import Image as PILImage
 
 from data.transforms import get_eval_transforms
+from models.builder import describe, load_spade
 from models.spade import SPADE
 from utils.heatmap import patches_to_heatmap, overlay_heatmap, save_heatmap
 
@@ -52,44 +53,11 @@ def load_config() -> dict:
 
 
 def _load_model(checkpoint: str, cfg: dict, device: torch.device) -> SPADE:
-    _print("[1/4] Initializing vision backbone and query transformer...")
-    model = SPADE(
-        blip2_model_name=cfg["blip2"]["model_name"],
-        llm_embed_dim=cfg["projection"]["output_dim"],
-        hpa_n_max=cfg["hpa"]["n_max"],
-        hpa_n_min=cfg["hpa"]["n_min"],
-        hpa_t_steps=cfg["hpa"]["t_steps"],
-        hpa_w=cfg["hpa"]["w"],
-        hpa_p1=cfg["hpa"]["p1"],
-        hpa_p2=cfg["hpa"]["p2"],
-        score_alpha=cfg["scoring"]["alpha"],
-        score_beta=cfg["scoring"]["beta"],
-        score_lambda=cfg["scoring"]["lambda"],
-        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
-        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
-        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
-        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
-    ).to(device)
-
-    if cfg.get("frequency", {}).get("enabled", False):
-        model.enable_frequency_features(
-            freq_num_bands=cfg["frequency"].get("num_bands", 6),
-            freq_use_phase=cfg["frequency"].get("use_phase", True),
-            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
-            score_gamma=cfg["scoring"].get("gamma", 0.25),
-        )
-
-    _print("      Loading learned parameters from checkpoint...")
-    state = torch.load(checkpoint, map_location=device, weights_only=True)
-    key = "model_state_dict" if "model_state_dict" in state else None
-    model.load_state_dict(state[key] if key else state, strict=False)
-    model.to(device)
-
-    use_hpa = cfg.get("hpa", {}).get("enabled", False)
-    model.use_hpa = bool(use_hpa)
-    model.eval()
-
-    _print(f"      Checkpoint loaded  (HPA={'on' if use_hpa else 'off'})")
+    """Load SPADE through the shared builder (models/builder.py)."""
+    _print("[1/4] Loading SPADE ...")
+    model, _ = load_spade(cfg, checkpoint, device=device)
+    _print(f"      {describe(model)}")
+    _print("      Checkpoint loaded")
     return model
 
 

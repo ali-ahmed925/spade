@@ -21,6 +21,7 @@ import wandb
 import matplotlib.pyplot as plt
 
 from data.mvtec_dataset import MVTecDataset
+from models.builder import describe, load_spade
 from models.spade import SPADE
 from utils.heatmap import patches_to_heatmap, overlay_heatmap, save_heatmap
 from utils.logging import get_logger
@@ -545,113 +546,11 @@ def main() -> None:
     logger.info(f"Test samples: {len(dataset)}")
 
     # ── Model ──
-    model = SPADE(
-        blip2_model_name=cfg["blip2"]["model_name"],
-        llm_embed_dim=cfg["projection"]["output_dim"],
-        # HPA parameters
-        hpa_n_max=cfg["hpa"]["n_max"],
-        hpa_n_min=cfg["hpa"]["n_min"],
-        hpa_t_steps=cfg["hpa"]["t_steps"],
-        hpa_w=cfg["hpa"]["w"],
-        hpa_p1=cfg["hpa"]["p1"],
-        hpa_p2=cfg["hpa"]["p2"],
-        # Scoring parameters
-        score_alpha=cfg["scoring"]["alpha"],
-        score_beta=cfg["scoring"]["beta"],
-        score_lambda=cfg["scoring"]["lambda"],
-        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
-        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
-        # Normal statistics parameters
-        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
-        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
-        # Scoring-correctness knobs (default to the corrected behaviour)
-        normalize_streams=cfg.get("scoring", {}).get("normalize_streams", True),
-        attention_aggregation=cfg.get("scoring", {}).get("attention_aggregation", "logit_mean"),
-    ).to(device)
+    model, ckpt_meta = load_spade(cfg, args.checkpoint, device=device, logger=logger)
+    logger.info(f"model: {describe(model)}")
+    if "config" in ckpt_meta:
+        logger.info(f"checkpoint config: {ckpt_meta['config']}")
 
-    # Enable frequency features if configured (before loading checkpoint)
-    if cfg.get("frequency", {}).get("enabled", False):
-        model.enable_frequency_features(
-            freq_num_bands=cfg["frequency"].get("num_bands", 6),
-            freq_use_phase=cfg["frequency"].get("use_phase", True),
-            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
-            score_gamma=cfg["scoring"].get("gamma", 0.25),
-        )
-        logger.info("Frequency features enabled")
-    else:
-        logger.info("Frequency features disabled")
-
-    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    if "model_state_dict" in state:
-        # Load only trainable parameters (Q-Former + custom heads)
-        # Vision encoder will remain frozen from BLIP-2 initialization
-        model.load_state_dict(state["model_state_dict"], strict=False)
-        checkpoint_epoch = state.get("epoch", "unknown")
-        logger.info(f"Loaded checkpoint: {args.checkpoint} (epoch: {checkpoint_epoch})")
-        if "config" in state:
-            logger.info(f"Checkpoint config: {state['config']}")
-    else:
-        # Legacy format: assume full state_dict
-        model.load_state_dict(state, strict=False)
-        checkpoint_epoch = "unknown"
-        logger.info(f"Loaded checkpoint: {args.checkpoint} (legacy format)")
-    # Move all buffers (including freq_mahalanobis_scorer.mu/sigma_inv) to device.
-    # enable_frequency_features() creates submodules on CPU; load_state_dict also
-    # keeps buffers on CPU when map_location is used. This ensures everything aligns.
-    model.to(device)
-    
-    # ⚠️ CRITICAL: Set HPA enabled/disabled AFTER loading checkpoint
-    # Use runtime config (not checkpoint config) to allow testing different settings
-    use_hpa = cfg.get("hpa", {}).get("enabled", True)
-    
-    # ⚠️ CRITICAL: Check if checkpoint config is trying to override (warn but don't use it)
-    if "config" in state and "hpa" in state["config"]:
-        checkpoint_hpa_enabled = state["config"]["hpa"].get("enabled", None)
-        if checkpoint_hpa_enabled is not None and checkpoint_hpa_enabled != use_hpa:
-            logger.warning(
-                f"⚠️ CHECKPOINT CONFIG MISMATCH: "
-                f"Checkpoint was saved with HPA enabled={checkpoint_hpa_enabled}, "
-                f"but runtime config has HPA enabled={use_hpa}. "
-                f"Using RUNTIME config (HPA enabled={use_hpa})."
-            )
-    
-    # ⚠️ CRITICAL: Force set use_hpa and verify it's actually set
-    model.use_hpa = use_hpa
-    logger.info(f"🔧 SET model.use_hpa = {use_hpa} (type: {type(use_hpa)})")
-    
-    # ⚠️ CRITICAL: Verify it's actually set correctly
-    if model.use_hpa != use_hpa:
-        logger.error(f"❌ CRITICAL BUG: model.use_hpa ({model.use_hpa}) != config ({use_hpa})! Fixing...")
-        model.use_hpa = use_hpa
-        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa}")
-    
-    # ⚠️ CRITICAL: Double-check it's a boolean
-    if not isinstance(model.use_hpa, bool):
-        logger.error(f"❌ CRITICAL BUG: model.use_hpa is not a boolean! Value: {model.use_hpa}, type: {type(model.use_hpa)}")
-        model.use_hpa = bool(use_hpa)
-        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa} (forced to boolean)")
-    
-    if model.use_hpa:
-        logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
-    else:
-        logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
-    
-    # Verify HPA setting is correct (double-check after potential state_dict loading)
-    logger.info(f"⚠️ FINAL VERIFICATION: model.use_hpa = {model.use_hpa} (type: {type(model.use_hpa)}, should match config: {use_hpa})")
-
-    # ── Single-image mode ──
-    if args.image is not None:
-        evaluate_single_image(
-            model=model,
-            image_path=args.image,
-            device=device,
-            image_size=cfg["vit"]["image_size"],
-            patch_size=cfg["vit"]["patch_size"],
-            save_dir=args.save_heatmaps,
-        )
-        return
-
-    # ── Evaluate ──
     # ── P1: swap in position-conditioned Mahalanobis ──
     if args.positional:
         from models.positional_mahalanobis import build_positional_scorer

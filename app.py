@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 # ── Local imports (SPADE pipeline) ────────────────────────────────────────────
 from data.transforms import get_eval_transforms
+from models.builder import describe, load_spade
 from models.spade import SPADE
 from utils.heatmap import patches_to_heatmap, overlay_heatmap
 
@@ -214,45 +215,18 @@ print(f"[SPADE] Using device: {_device}")
 
 
 def _load_spade(category: str) -> SPADE:
+    """Load one category's model through the shared builder.
+
+    MODEL_CFG is config/model.yaml, so the demo automatically follows the
+    pipeline's resolution, tapped layers and descriptor width — there is no
+    second copy of the construction arguments to drift out of sync.
+    """
     ckpt_path = os.path.join(CHECKPOINTS_ROOT, category, "spade_best.pt")
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"No checkpoint for category '{category}' at {ckpt_path}")
 
-    model = SPADE(
-        blip2_model_name=MODEL_CFG["blip2"]["model_name"],
-        llm_embed_dim=MODEL_CFG["projection"]["output_dim"],
-        hpa_n_max=MODEL_CFG["hpa"]["n_max"],
-        hpa_n_min=MODEL_CFG["hpa"]["n_min"],
-        hpa_t_steps=MODEL_CFG["hpa"]["t_steps"],
-        hpa_w=MODEL_CFG["hpa"]["w"],
-        hpa_p1=MODEL_CFG["hpa"]["p1"],
-        hpa_p2=MODEL_CFG["hpa"]["p2"],
-        score_alpha=MODEL_CFG["scoring"]["alpha"],
-        score_beta=MODEL_CFG["scoring"]["beta"],
-        score_lambda=MODEL_CFG["scoring"]["lambda"],
-        mahalanobis_gamma=MODEL_CFG["scoring"]["mahalanobis_gamma"],
-        mahalanobis_reg=MODEL_CFG["scoring"]["mahalanobis_reg"],
-        normal_stats_buffer_size=MODEL_CFG["normal_stats"]["buffer_size"],
-        normal_stats_update_frequency=MODEL_CFG["normal_stats"]["update_frequency"],
-        # Scoring-correctness knobs (default to the corrected behaviour)
-        normalize_streams=MODEL_CFG.get("scoring", {}).get("normalize_streams", True),
-        attention_aggregation=MODEL_CFG.get("scoring", {}).get("attention_aggregation", "logit_mean"),
-    ).to(_device)
-
-    if MODEL_CFG.get("frequency", {}).get("enabled", False):
-        model.enable_frequency_features(
-            freq_num_bands=MODEL_CFG["frequency"].get("num_bands", 6),
-            freq_use_phase=MODEL_CFG["frequency"].get("use_phase", True),
-            freq_feature_dim=MODEL_CFG["frequency"].get("feature_dim", 32),
-            score_gamma=MODEL_CFG["scoring"].get("gamma", 0.25),
-        )
-
-    state = torch.load(ckpt_path, map_location=_device, weights_only=True)
-    key = "model_state_dict" if "model_state_dict" in state else None
-    model.load_state_dict(state[key] if key else state, strict=False)
-    model.to(_device)
-    model.use_hpa = bool(MODEL_CFG.get("hpa", {}).get("enabled", False))
-    model.eval()
+    model, _ = load_spade(MODEL_CFG, ckpt_path, device=_device)
+    print(f"[SPADE] {category}: {describe(model)}")
     return model
 
 

@@ -55,7 +55,9 @@ def fit(
         if not batch_tensors:
             return
         images = torch.stack(batch_tensors).to(device)
-        embeds = model.vision_encoder(images)[:, 1:, :].float()  # (B, N, D)
+        # The scorer consumes CONTEXTUAL DESCRIPTORS; statistics must be fitted
+        # in that space or the per-position means would have the wrong width.
+        embeds = model.build_descriptors(images)["descriptors"].float()  # (B, N, C)
         if accumulator is None:
             _, n_positions, feature_dim = embeds.shape
             logger.info(f"feature dim {feature_dim}, {n_positions} positions")

@@ -202,7 +202,7 @@ def test_swaps_into_spade_and_changes_scores():
 
     torch.manual_seed(0)
     images = torch.randn(2, 3, 224, 224)
-    model = make_stub_spade(hpa=False)
+    model = make_stub_spade()
     fit_statistics(model, images)
     model.eval()
 

@@ -19,7 +19,7 @@ import yaml
 from PIL import Image
 
 from data.transforms import get_eval_transforms
-from models.spade import SPADE
+from models.builder import describe, load_spade
 from models.llm import FrozenLLM
 from utils.heatmap import patches_to_heatmap, overlay_heatmap, save_heatmap
 from utils.logging import get_logger
@@ -49,64 +49,9 @@ def main() -> None:
     patch_size = cfg["vit"]["patch_size"]
 
     # ── Load model ──
-    model = SPADE(
-        blip2_model_name=cfg["blip2"]["model_name"],
-        llm_embed_dim=cfg["projection"]["output_dim"],
-        # HPA parameters
-        hpa_n_max=cfg["hpa"]["n_max"],
-        hpa_n_min=cfg["hpa"]["n_min"],
-        hpa_t_steps=cfg["hpa"]["t_steps"],
-        hpa_w=cfg["hpa"]["w"],
-        hpa_p1=cfg["hpa"]["p1"],
-        hpa_p2=cfg["hpa"]["p2"],
-        # Scoring parameters
-        score_alpha=cfg["scoring"]["alpha"],
-        score_beta=cfg["scoring"]["beta"],
-        score_lambda=cfg["scoring"]["lambda"],
-        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
-        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
-        # Normal statistics parameters
-        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
-        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
-        # Scoring-correctness knobs (default to the corrected behaviour)
-        normalize_streams=cfg.get("scoring", {}).get("normalize_streams", True),
-        attention_aggregation=cfg.get("scoring", {}).get("attention_aggregation", "logit_mean"),
-    ).to(device)
+    model, ckpt_meta = load_spade(cfg, args.checkpoint, device=device, logger=logger)
+    logger.info(f"model: {describe(model)}")
 
-    # Enable/disable HPA based on config
-    use_hpa = cfg.get("hpa", {}).get("enabled", True)
-    model.use_hpa = use_hpa
-    if use_hpa:
-        logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
-    else:
-        logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
-    
-    # Enable frequency features if configured
-    if cfg.get("frequency", {}).get("enabled", False):
-        model.enable_frequency_features(
-            freq_num_bands=cfg["frequency"].get("num_bands", 6),
-            freq_use_phase=cfg["frequency"].get("use_phase", True),
-            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
-            score_gamma=cfg["scoring"].get("gamma", 0.25),
-        )
-        logger.info("Frequency features enabled")
-    else:
-        logger.info("Frequency features disabled")
-
-    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    if "model_state_dict" in state:
-        # Load only trainable parameters (Q-Former + custom heads)
-        # Vision encoder will remain frozen from BLIP-2 initialization
-        model.load_state_dict(state["model_state_dict"], strict=False)
-        checkpoint_epoch = state.get("epoch", "unknown")
-        logger.info(f"Loaded checkpoint: {args.checkpoint} (epoch: {checkpoint_epoch})")
-        if "config" in state:
-            logger.info(f"Checkpoint config: {state['config']}")
-    else:
-        # Legacy format: assume full state_dict
-        model.load_state_dict(state, strict=False)
-        logger.info(f"Loaded checkpoint: {args.checkpoint} (legacy format)")
-    model.eval()
 
     # ── Load and preprocess image ──
     image_np = cv2.imread(args.image)

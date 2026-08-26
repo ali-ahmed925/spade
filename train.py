@@ -18,6 +18,7 @@ import numpy as np
 
 from data.mvtec_dataset import MVTecDataset
 from losses.total_loss import TotalLoss
+from models.builder import build_spade, describe
 from models.spade import SPADE
 from optim.optimizer import build_optimizer
 from optim.scheduler import build_scheduler
@@ -93,7 +94,7 @@ def train_one_epoch(
             score_mean = patch_scores.mean().item()
             score_max = patch_scores.max().item()
             score_min = patch_scores.min().item()
-            logger.info(f"Epoch {epoch} Step {step}: HPA enabled={model.use_hpa}, "
+            logger.info(f"Epoch {epoch} Step {step}: patches={patch_scores.shape[1]}, "
                   f"scores mean={score_mean:.4f}, min={score_min:.4f}, max={score_max:.4f}, "
                   f"hash={patch_scores_hash}")
 
@@ -239,7 +240,7 @@ def main() -> None:
                 "model": cfg.get("blip2", {}),
                 "vit": cfg.get("vit", {}),
                 "qformer": cfg.get("qformer", {}),
-                "hpa": cfg.get("hpa", {}),
+                "context": cfg.get("context", {}),
                 "scoring": cfg.get("scoring", {}),
                 "normal_stats": cfg.get("normal_stats", {}),
                 "projection": cfg.get("projection", {}),
@@ -376,67 +377,12 @@ def main() -> None:
         logger.info("Cleared GPU cache before model loading")
     
     # ── Model ──
-    model = SPADE(
-        blip2_model_name=cfg["blip2"]["model_name"],
-        llm_embed_dim=cfg["projection"]["output_dim"],
-        # HPA parameters
-        hpa_n_max=cfg["hpa"]["n_max"],
-        hpa_n_min=cfg["hpa"]["n_min"],
-        hpa_t_steps=cfg["hpa"]["t_steps"],
-        hpa_w=cfg["hpa"]["w"],
-        hpa_p1=cfg["hpa"]["p1"],
-        hpa_p2=cfg["hpa"]["p2"],
-        # Scoring parameters
-        score_alpha=cfg["scoring"]["alpha"],
-        score_beta=cfg["scoring"]["beta"],
-        score_lambda=cfg["scoring"]["lambda"],
-        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
-        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
-        # Normal statistics parameters
-        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
-        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
-        # Scoring-correctness knobs (default to the corrected behaviour)
-        normalize_streams=cfg.get("scoring", {}).get("normalize_streams", True),
-        attention_aggregation=cfg.get("scoring", {}).get("attention_aggregation", "logit_mean"),
-    ).to(device)
-
-    # Enable/disable HPA based on config
-    use_hpa = cfg.get("hpa", {}).get("enabled", True)
-    
-    # ⚠️ CRITICAL: Force set and verify
-    model.use_hpa = use_hpa
-    logger.info(f"🔧 SET model.use_hpa = {use_hpa} (type: {type(use_hpa)})")
-    
-    # ⚠️ CRITICAL: Verify it's actually set correctly
-    if model.use_hpa != use_hpa:
-        logger.error(f"❌ CRITICAL BUG: model.use_hpa ({model.use_hpa}) != config ({use_hpa})! Fixing...")
-        model.use_hpa = use_hpa
-        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa}")
-    
-    # ⚠️ CRITICAL: Double-check it's a boolean
-    if not isinstance(model.use_hpa, bool):
-        logger.error(f"❌ CRITICAL BUG: model.use_hpa is not a boolean! Value: {model.use_hpa}, type: {type(model.use_hpa)}")
-        model.use_hpa = bool(use_hpa)
-        logger.info(f"✅ Fixed: model.use_hpa = {model.use_hpa} (forced to boolean)")
-    
-    if model.use_hpa:
-        logger.info("HPA enabled - queries will be refined through hierarchical patch annealing")
-    else:
-        logger.info("HPA disabled - queries will attend to all patches directly (no refinement)")
-    
-    logger.info(f"⚠️ FINAL VERIFICATION: model.use_hpa = {model.use_hpa} (type: {type(model.use_hpa)})")
-    
-    # Enable frequency features if configured
-    if cfg.get("frequency", {}).get("enabled", False):
-        model.enable_frequency_features(
-            freq_num_bands=cfg["frequency"].get("num_bands", 6),
-            freq_use_phase=cfg["frequency"].get("use_phase", True),
-            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
-            score_gamma=cfg["scoring"].get("gamma", 0.25),
-        )
-        logger.info("Frequency features enabled")
-    else:
-        logger.info("Frequency features disabled")
+    model = build_spade(cfg, device=device)
+    logger.info(f"model: {describe(model)}")
+    logger.info(
+        "frequency stream: "
+        + ("enabled" if model.use_frequency else "disabled")
+    )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -634,9 +580,12 @@ def main() -> None:
                         "config": {
                             "blip2_model_name": cfg["blip2"]["model_name"],
                             "llm_embed_dim": cfg["projection"]["output_dim"],
-                            "hpa": cfg["hpa"],
+                            "vit": cfg["vit"],
+                            "context": cfg.get("context", {}),
                             "scoring": cfg["scoring"],
                             "normal_stats": cfg["normal_stats"],
+                            "descriptor_dim": model.descriptor_dim,
+                            "num_patches": model.num_patches,
                         },
                     }, best_path)
                     logger.info(

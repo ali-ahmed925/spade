@@ -2,8 +2,8 @@
 dataset:
   name: "mvtec"
   root: "./datasets/mvtec_anomaly_detection"
-  category: "bottle"                      # single category or "all"
-  image_size: 224
+  category: "cable"
+  image_size: 448                         # must match vit.image_size (32x32 patch grid)
   num_workers: 4
 
 # ── Synthetic Anomaly Generation ──

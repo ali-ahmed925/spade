@@ -67,7 +67,7 @@ def dataset(fake_mvtec):
 
 @pytest.fixture
 def model(dataset):
-    m = make_stub_spade(hpa=False)
+    m = make_stub_spade()
     images = torch.stack([dataset[i]["image"] for i in range(len(dataset))])
     fit_statistics(m, images)
     m.eval()
@@ -78,9 +78,10 @@ def _fine_stats_from(model, dataset):
     """Stand-in for scripts/fit_fine_statistics.py output."""
     images = torch.stack([dataset[i]["image"] for i in range(len(dataset))])
     with torch.no_grad():
-        embeds = model.vision_encoder(images)[:, 1:, :].float().reshape(-1, 32)
-    scorer = type(model.mahalanobis_scorer)(feature_dim=32, regularization=1e-4)
-    scorer.update_statistics(embeds)
+        descriptors = model.build_descriptors(images)["descriptors"]
+    dim = descriptors.shape[-1]
+    scorer = type(model.mahalanobis_scorer)(feature_dim=dim, regularization=1e-4)
+    scorer.update_statistics(descriptors.reshape(-1, dim))
     return {
         "spatial": {"mu": scorer.mu.clone(), "sigma_inv": scorer.sigma_inv.clone()},
         "meta": {"grid": 3, "overlap": 0.5},
@@ -160,7 +161,7 @@ def test_dense_tiling_refuses_uninitialized_statistics(model, dataset):
     from data.transforms import get_eval_transforms
     from models.mahalanobis_scoring import MahalanobisScoring
 
-    empty = MahalanobisScoring(feature_dim=32)
+    empty = MahalanobisScoring(feature_dim=model.descriptor_dim)
     with pytest.raises(RuntimeError, match="fine-scale"):
         _dense_tiling_map(
             model=model, image_path=dataset.image_paths[0],

@@ -1,4 +1,8 @@
-"""Utility for extracting image patches from tensors."""
+"""Utility for extracting image patches from tensors.
+
+Grid size is derived from the input resolution, so the same call yields 16x16=256
+patches at 224 and 32x32=1024 at 448.
+"""
 
 import torch
 import numpy as np
@@ -9,14 +13,14 @@ def extract_image_patches_from_tensor(
     patch_size: int = 14,
 ) -> np.ndarray:
     """
-    Extract 14×14 patches from CLIP-normalized images.
-    
+    Extract patch_size x patch_size patches from CLIP-normalized images.
+
     Args:
-        images: (B, 3, 224, 224) normalized tensor
-        patch_size: patch size (14 for ViT-B/14)
-    
+        images: (B, 3, H, W) normalized tensor; H must be divisible by patch_size
+        patch_size: ViT patch size (14 for ViT-G/14)
+
     Returns:
-        patches: (B*N, 14, 14, 3) uint8 numpy array [0, 255]
+        patches: (B * (H//patch_size)**2, patch_size, patch_size, 3) uint8 [0, 255]
     """
     B, C, H, W = images.shape
     device = images.device
@@ -36,7 +40,7 @@ def extract_image_patches_from_tensor(
     images_np = images_denorm.cpu().numpy().transpose(0, 2, 3, 1)
     
     # Extract patches
-    grid_size = H // patch_size  # 16
+    grid_size = H // patch_size  # 16 at 224, 32 at 448
     all_patches = []
     
     for img in images_np:
@@ -49,5 +53,5 @@ def extract_image_patches_from_tensor(
                 patches.append(patch)
         all_patches.extend(patches)
     
-    return np.array(all_patches, dtype=np.uint8)  # (B*256, 14, 14, 3)
+    return np.array(all_patches, dtype=np.uint8)  # (B*grid^2, p, p, 3)
 

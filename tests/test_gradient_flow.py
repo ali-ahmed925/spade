@@ -6,6 +6,10 @@ These tests exist because a whole training pipeline ran for months in which:
   * the only gradient-bearing score term was ~1e-5 of the score, and
   * the attention importance had a structurally constant patch-mean.
 
+The feature-space redesign removed that additive attention term entirely — the
+Q-Former now enters through the descriptor Mahalanobis scores — but the
+invariants below still hold and still guard the same failure modes.
+
 None of these raised an error. Each one below is pinned by a test so it cannot
 come back silently.
 
@@ -17,7 +21,6 @@ import torch
 
 from losses.patch_loss_normal import PseudoAnomalyLoss
 from losses.total_loss import TotalLoss
-from models.hierarchical_patch_refinement import QueryPatchAttention
 from tests.stub_blip2 import fit_statistics, make_stub_spade
 from utils.grad_audit import (
     classify_parameters,
@@ -27,7 +30,7 @@ from utils.grad_audit import (
 )
 
 BATCH = 2
-N_PATCHES = 256
+N_PATCHES = 256   # 224px stub -> 16x16 grid
 
 
 @pytest.fixture
@@ -38,7 +41,7 @@ def images():
 
 @pytest.fixture
 def model(images):
-    m = make_stub_spade(hpa=False)
+    m = make_stub_spade()
     fit_statistics(m, images)
     m.train()
     return m
@@ -119,25 +122,10 @@ def test_stream_normalization_makes_weights_meaningful(model, images):
     model.eval()
     out = model(images)
     shares = component_contributions(out["score_components"])
-    assert shares["attention"] > 1e-3, (
-        f"attention term is {shares['attention']:.2e} of the score — the "
-        "configured weight is not what is actually applied"
+    assert shares["contextual_mahalanobis"] > 1e-3, (
+        f"the contextual Mahalanobis term is {shares['contextual_mahalanobis']:.2e} "
+        "of the score — the configured weight is not what is actually applied"
     )
-
-
-def test_legacy_mode_reproduces_unnormalized_composition(images):
-    """normalize_streams=False must leave the legacy arithmetic untouched."""
-    m = make_stub_spade(normalize_streams=False, attention_aggregation="softmax_sum")
-    fit_statistics(m, images)
-    m.eval()
-    out = m(images)
-    manual = (
-        m.score_alpha * (out["score_components"]["attention"] / m.score_alpha)
-        + out["score_components"]["spatial_mahalanobis"]
-        + out["score_components"]["frequency"]
-        + out["score_components"]["cross"]
-    )
-    assert torch.allclose(manual, out["patch_scores"], atol=1e-5)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -182,36 +170,6 @@ def test_perturbed_patches_score_differently_from_clean(model, images):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 4. Attention aggregation must not be structurally constant
-# ──────────────────────────────────────────────────────────────────────────
-def test_softmax_sum_aggregation_has_constant_patch_mean():
-    """Documents why the legacy mode cannot be trained by a mean-based loss."""
-    attn = QueryPatchAttention(16, 32, aggregation="softmax_sum")
-    q, p = torch.randn(3, 4, 16), torch.randn(3, 256, 32)
-    _, importance = attn(q, p)
-    means = importance.mean(dim=1)
-    assert torch.allclose(means, torch.full_like(means, 4 / 256), atol=1e-6)
-
-
-def test_logit_mean_aggregation_varies_with_weights():
-    attn = QueryPatchAttention(16, 32, aggregation="logit_mean")
-    q, p = torch.randn(3, 4, 16), torch.randn(3, 256, 32)
-    _, importance = attn(q, p)
-    means = importance.mean(dim=1)
-    assert means.std() > 1e-6, "importance mean should vary across images"
-
-    with torch.no_grad():
-        attn.query_proj.weight.mul_(2.0)
-    _, importance2 = attn(q, p)
-    assert not torch.allclose(importance, importance2)
-
-
-def test_invalid_aggregation_rejected():
-    with pytest.raises(ValueError):
-        QueryPatchAttention(16, 32, aggregation="nonsense")
-
-
-# ──────────────────────────────────────────────────────────────────────────
 # 5. Optimizer / checkpoint integrity
 # ──────────────────────────────────────────────────────────────────────────
 def test_optimizer_only_receives_parameters_that_get_gradients(model, images):
@@ -229,7 +187,7 @@ def test_checkpoint_keeps_stream_scale_buffers(model, images):
     """The old allowlist-based save silently dropped newly added state."""
     _train_step(model, images)
     state = {k: v for k, v in model.state_dict().items() if not k.startswith("vision_encoder.")}
-    for key in ("attn_scale", "mahal_scale", "freq_scale", "stream_scales_initialized"):
+    for key in ("mahal_scale", "freq_scale", "stream_scales_initialized"):
         assert key in state, f"{key} would not survive a save/load round trip"
 
 

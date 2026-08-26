@@ -9,8 +9,9 @@ different blur, different feature distribution. Scoring zoomed crops against
 whole-image statistics produces distances that look plausible and mean nothing.
 
 So the fine scale gets its own statistics, estimated the same closed-form way
-(mean + covariance over normal patches) from train/good only. No gradients, no
-optimizer, no labels.
+(mean + covariance over normal patches) from train/good only, in the SAME
+contextual-descriptor space the model scores. No gradients, no optimizer, no
+labels.
 
 OUTPUT
 ------
@@ -42,6 +43,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.transforms import get_eval_transforms  # noqa: E402
+from models.builder import load_spade  # noqa: E402
 from models.spade import SPADE  # noqa: E402
 from models.tiling import crops_from_image, tile_boxes  # noqa: E402
 from utils.logging import get_logger  # noqa: E402
@@ -57,41 +59,12 @@ def load_config() -> dict:
 
 
 def build_model(cfg: dict, checkpoint: str, device: torch.device) -> SPADE:
-    """Build SPADE exactly as eval.py does, so the scoring path is identical."""
-    model = SPADE(
-        blip2_model_name=cfg["blip2"]["model_name"],
-        llm_embed_dim=cfg["projection"]["output_dim"],
-        hpa_n_max=cfg["hpa"]["n_max"],
-        hpa_n_min=cfg["hpa"]["n_min"],
-        hpa_t_steps=cfg["hpa"]["t_steps"],
-        hpa_w=cfg["hpa"]["w"],
-        hpa_p1=cfg["hpa"]["p1"],
-        hpa_p2=cfg["hpa"]["p2"],
-        score_alpha=cfg["scoring"]["alpha"],
-        score_beta=cfg["scoring"]["beta"],
-        score_lambda=cfg["scoring"]["lambda"],
-        mahalanobis_gamma=cfg["scoring"]["mahalanobis_gamma"],
-        mahalanobis_reg=cfg["scoring"]["mahalanobis_reg"],
-        normal_stats_buffer_size=cfg["normal_stats"]["buffer_size"],
-        normal_stats_update_frequency=cfg["normal_stats"]["update_frequency"],
-        normalize_streams=cfg.get("scoring", {}).get("normalize_streams", True),
-        attention_aggregation=cfg.get("scoring", {}).get("attention_aggregation", "logit_mean"),
-    ).to(device)
+    """Build SPADE exactly as eval.py does, so the scoring path is identical.
 
-    if cfg.get("frequency", {}).get("enabled", False):
-        model.enable_frequency_features(
-            freq_num_bands=cfg["frequency"].get("num_bands", 6),
-            freq_use_phase=cfg["frequency"].get("use_phase", True),
-            freq_feature_dim=cfg["frequency"].get("feature_dim", 32),
-            score_gamma=cfg["scoring"].get("gamma", 0.25),
-        )
-
-    state = torch.load(checkpoint, map_location=device, weights_only=True)
-    state_dict = state.get("model_state_dict", state)
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    model.use_hpa = bool(cfg.get("hpa", {}).get("enabled", False))
-    model.eval()
+    Thin wrapper over models.builder.load_spade, kept because several diagnostic
+    scripts import this name.
+    """
+    model, _ = load_spade(cfg, checkpoint, device=device)
     return model
 
 
@@ -131,8 +104,10 @@ def fit(
 
         batch = torch.stack([transform(PILImage.fromarray(c)) for c in crops]).to(device)
 
-        # Spatial features: the same frozen encoder output the scorer consumes.
-        embeds = model.vision_encoder(batch)[:, 1:, :].float()  # (T, N, D)
+        # The scorer consumes CONTEXTUAL DESCRIPTORS, not raw ViT embeddings, so
+        # the statistics must be fitted in that same space or the swapped-in
+        # sidecar would have the wrong width entirely.
+        embeds = model.build_descriptors(batch)["descriptors"].float()  # (T, N, C)
         flat = embeds.reshape(-1, embeds.shape[-1])
 
         # Subsample per image so one image cannot dominate the covariance.
