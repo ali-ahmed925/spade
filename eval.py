@@ -456,6 +456,22 @@ def main() -> None:
         "--fine-stats", type=str, default=None,
         help="Path to fine-scale statistics (default: checkpoints/<cat>/fine_stats_g<grid>_o<overlap>.pt)",
     )
+    parser.add_argument(
+        "--positional", action="store_true",
+        help="P1: score with per-position Mahalanobis means instead of one global "
+             "mean. Targets structural/positional defects (transistor misplaced, "
+             "cable_swap) that a position-agnostic Gaussian cannot see. Requires "
+             "scripts/fit_positional_statistics.py.",
+    )
+    parser.add_argument(
+        "--positional-stats", type=str, default=None,
+        help="Path to positional statistics (default: checkpoints/<cat>/positional_stats.pt)",
+    )
+    parser.add_argument(
+        "--position-blend", type=float, default=1.0,
+        help="1.0 = per-position means; 0.0 = global mean (the control arm, which "
+             "reproduces current behaviour); values between interpolate.",
+    )
     args = parser.parse_args()
 
     cfg = load_config()
@@ -636,6 +652,35 @@ def main() -> None:
         return
 
     # ── Evaluate ──
+    # ── P1: swap in position-conditioned Mahalanobis ──
+    if args.positional:
+        from models.positional_mahalanobis import build_positional_scorer
+
+        pstats_path = args.positional_stats or f"checkpoints/{category}/positional_stats.pt"
+        if not os.path.exists(pstats_path):
+            raise FileNotFoundError(
+                f"positional statistics not found: {pstats_path}\n"
+                f"Run: python scripts/fit_positional_statistics.py --category {category}"
+            )
+        pstats = torch.load(pstats_path, map_location="cpu", weights_only=False)
+        model.mahalanobis_scorer = build_positional_scorer(
+            pstats,
+            blend=args.position_blend,
+            gamma=cfg["scoring"]["mahalanobis_gamma"],
+            device=device,
+        )
+        pmeta = pstats.get("meta", {})
+        logger.info(
+            f"POSITIONAL Mahalanobis: blend={args.position_blend}, "
+            f"{pstats['n_positions']} positions, fitted on {pstats['n_images']} images "
+            f"({pstats['samples_per_dim']:.1f} samples/dim, shrinkage={pmeta.get('shrinkage')})"
+        )
+        if pmeta.get("category") not in (None, category):
+            logger.warning(
+                f"statistics were fitted for '{pmeta.get('category')}' but you are "
+                f"evaluating '{category}'"
+            )
+
     # ── Smoothing (applies to BOTH arms of any comparison) ──
     smooth_sigma = (
         args.smooth_sigma
@@ -695,6 +740,7 @@ def main() -> None:
         f"[config] split={args.split} smooth_sigma={smooth_sigma} "
         f"dense_tiling={bool(tiling)}"
         + (f" grid={args.grid} overlap={args.overlap}" if tiling else "")
+        + (f" positional=True blend={args.position_blend}" if args.positional else " positional=False")
     )
 
     # ── Log to wandb ──
