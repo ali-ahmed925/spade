@@ -204,3 +204,39 @@ def test_training_actually_changes_parameters(model, images):
         if p.requires_grad and not torch.allclose(before[n], p.detach())
     ]
     assert moved, "no trainable parameter moved after an optimizer step"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 6. Image-score aggregation
+# ──────────────────────────────────────────────────────────────────────────
+def test_both_aggregations_available_and_differ(model, images):
+    """max and topk_mean must be selectable and must not be the same statistic."""
+    model.eval()
+    scores = model(images)["patch_scores"]
+    topk = model.get_image_score(scores, aggregation="topk_mean")
+    mx = model.get_image_score(scores, aggregation="max")
+    assert topk.shape == mx.shape == (BATCH,)
+    assert torch.all(mx >= topk - 1e-6), "max must be >= the mean of the top k"
+    assert not torch.allclose(topk, mx), "with k>1 the two must differ"
+
+
+def test_top_k_scales_with_patch_count(model):
+    """k tracks the grid so the top-k mean covers a constant image AREA."""
+    assert model.top_k_for(256) == 3
+    assert model.top_k_for(1024) == 12
+    assert model.top_k_for(1) == 1
+
+
+def test_max_aggregation_is_a_single_patch(model, images):
+    model.eval()
+    scores = model(images)["patch_scores"]
+    assert torch.allclose(
+        model.get_image_score(scores, aggregation="max"), scores.max(dim=1).values
+    )
+
+
+def test_unknown_aggregation_rejected(model, images):
+    model.eval()
+    scores = model(images)["patch_scores"]
+    with pytest.raises(ValueError, match="topk_mean"):
+        model.get_image_score(scores, aggregation="median")

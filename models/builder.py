@@ -53,6 +53,7 @@ def build_spade(cfg: dict, device: torch.device | str = "cpu", blip2_model=None)
         mahalanobis_gamma=float(scoring.get("mahalanobis_gamma", 1.0)),
         mahalanobis_reg=float(scoring.get("mahalanobis_reg", 1e-4)),
         normalize_streams=scoring.get("normalize_streams", True),
+        image_aggregation=scoring.get("image_aggregation", "topk_mean"),
         normal_stats_buffer_size=stats.get("buffer_size", 20000),
         normal_stats_update_frequency=stats.get("update_frequency", 100),
         projection_trainable=cfg.get("projection", {}).get("trainable", False),

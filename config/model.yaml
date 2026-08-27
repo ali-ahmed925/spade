@@ -51,6 +51,13 @@ scoring:
   # is NOT per-image normalization (see EVALUATION_FIX.md).
   normalize_streams: true
 
+  # How per-patch scores become one image score. "max" is what PaDiM, PatchCore
+  # and the WACV reference use; "topk_mean" (k scaled with the patch grid) is
+  # what this repo has always used and is the non-standard choice. eval.py
+  # reports BOTH on every run so the difference is visible and never silently
+  # selected for whichever scores higher.
+  image_aggregation: "topk_mean"          # topk_mean | max
+
   # Gaussian sigma applied to the anomaly map before metrics. PaDiM/PatchCore/
   # SingleNet all smooth (~4 at 224px); scaled with resolution here.
   smooth_sigma: 8.0

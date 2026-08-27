@@ -166,6 +166,10 @@ def evaluate(
 
     all_labels: list[int] = []
     all_image_scores: list[float] = []
+    # Both aggregations are computed on every run so the choice is visible and
+    # can never be silently selected for whichever scores higher. The configured
+    # one drives the reported headline; the other is an always-on ablation row.
+    scores_by_aggregation: dict[str, list[float]] = {"topk_mean": [], "max": []}
     all_masks: list[np.ndarray] = []
     all_heatmaps: list[np.ndarray] = []
     all_image_info: list[dict] = []  # Store image paths and scores for detailed output
@@ -188,6 +192,10 @@ def evaluate(
             
             all_labels.append(label)
             all_image_scores.append(image_score)
+            for mode in scores_by_aggregation:
+                scores_by_aggregation[mode].append(
+                    float(model.get_image_score(patch_scores[i : i + 1], aggregation=mode).cpu())
+                )
             
             # Store image info for detailed output
             path_obj = Path(image_path)
@@ -303,6 +311,9 @@ def evaluate(
 
     results = {}
     results["image_auroc"] = compute_image_auroc(labels_arr, scores_arr)
+    for mode, vals in scores_by_aggregation.items():
+        if len(vals) == len(labels_arr):
+            results[f"image_auroc_{mode}"] = compute_image_auroc(labels_arr, np.array(vals))
 
     if masks_arr.max() > 0:
         results["pixel_auroc"] = compute_pixel_auroc(masks_arr, heatmaps_arr)
@@ -632,7 +643,14 @@ def main() -> None:
         smooth_sigma=smooth_sigma,
         tiling=tiling,
     )
-    logger.info(f"Image AUROC: {results['image_auroc']:.4f}")
+    configured = cfg.get("scoring", {}).get("image_aggregation", "topk_mean")
+    logger.info(f"Image AUROC: {results['image_auroc']:.4f}   [{configured}, configured]")
+    logger.info("  image-score aggregation ablation (same patch scores, both always reported):")
+    for mode in ("topk_mean", "max"):
+        key = f"image_auroc_{mode}"
+        if key in results:
+            mark = "  <- configured" if mode == configured else ""
+            logger.info(f"    {mode:<10} {results[key]:.4f}{mark}")
     logger.info(f"Pixel AUROC: {results['pixel_auroc']:.4f}")
     logger.info(f"PRO       : {results.get('pro', float('nan')):.4f}")
     logger.info(

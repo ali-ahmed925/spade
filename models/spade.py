@@ -78,6 +78,7 @@ class SPADE(nn.Module):
         mahalanobis_gamma: float = 1.0,
         mahalanobis_reg: float = 1e-4,
         normalize_streams: bool = True,
+        image_aggregation: str = "topk_mean",
         # ── normal statistics ──
         normal_stats_buffer_size: int = 20000,
         normal_stats_update_frequency: int = 100,
@@ -149,6 +150,7 @@ class SPADE(nn.Module):
             p_.requires_grad = bool(projection_trainable)
 
         # ── score weights ──
+        self.image_aggregation = image_aggregation
         self.score_beta = score_beta
         self.score_gamma = score_gamma
 
@@ -364,20 +366,45 @@ class SPADE(nn.Module):
         return outputs
 
     # ──────────────────────────────────────────────────────────────────────
-    def get_image_score(self, patch_scores: torch.Tensor) -> torch.Tensor:
-        """Aggregate patch scores into an image-level score (top-k mean).
+    def top_k_for(self, n_patches: int) -> int:
+        """How many patches the top-k mean averages, scaled with the patch grid.
 
-        k scales with the patch count so the aggregation covers the same image
-        AREA as before the resolution change: top-3 of 256 patches is 1.17% of
-        the image, and the equivalent at 1024 patches is top-12. Keeping k=3
-        would have silently made the image score 4x more selective and made
-        pre/post-redesign numbers incomparable.
+        top-3 of 256 patches covers 1.17% of the image; the equivalent at 1024
+        patches is 12. Keeping k=3 would silently make the image score 4x more
+        selective and make pre/post-redesign numbers incomparable.
+
+        Note the tension this creates, which is why both aggregations are
+        reported: a capsule crack spans ~3 patches at 448, so a top-12 mean
+        averages 3 defect patches with 9 normal ones.
         """
-        n_patches = patch_scores.shape[1]
-        k = max(1, round(3 * n_patches / 256))
-        k = min(k, n_patches)
-        top_k = torch.topk(patch_scores, k=k, dim=1).values
-        return top_k.mean(dim=1)
+        return max(1, min(round(3 * n_patches / 256), n_patches))
+
+    def get_image_score(
+        self,
+        patch_scores: torch.Tensor,
+        aggregation: str | None = None,
+    ) -> torch.Tensor:
+        """Reduce (B, N) patch scores to (B,) image scores.
+
+        aggregation:
+            "topk_mean"  mean of the top-k patches, k scaled to the grid.
+            "max"        the single highest patch. This is what PaDiM,
+                         PatchCore and the WACV SingleNet reference all use;
+                         the top-k mean is the non-standard choice here.
+
+        The choice is a METHOD component, not an evaluation protocol, so it must
+        be declared and ablated rather than picked for whichever scores higher.
+        eval.py reports both on every run.
+        """
+        mode = aggregation or self.image_aggregation
+        if mode == "max":
+            return patch_scores.max(dim=1).values
+        if mode == "topk_mean":
+            k = self.top_k_for(patch_scores.shape[1])
+            return torch.topk(patch_scores, k=k, dim=1).values.mean(dim=1)
+        raise ValueError(
+            f"image aggregation must be 'topk_mean' or 'max', got {mode!r}"
+        )
 
     def enable_frequency_features(
         self,
