@@ -230,27 +230,38 @@ def main() -> None:
     use_wandb = cfg.get("wandb", {}).get("enabled", False)
     if use_wandb:
         wandb_cfg = cfg["wandb"]
-        wandb.init(
-            project=wandb_cfg["project"],
-            entity=wandb_cfg.get("entity"),
-            name=wandb_cfg.get("name"),
-            tags=wandb_cfg.get("tags", []),
-            notes=wandb_cfg.get("notes"),
-            config={
-                "model": cfg.get("blip2", {}),
-                "vit": cfg.get("vit", {}),
-                "qformer": cfg.get("qformer", {}),
-                "context": cfg.get("context", {}),
-                "scoring": cfg.get("scoring", {}),
-                "normal_stats": cfg.get("normal_stats", {}),
-                "projection": cfg.get("projection", {}),
-                "dataset": cfg.get("dataset", {}),
-                "synthetic": cfg.get("synthetic", {}),
-                "training": tcfg,
-                "loss": cfg.get("loss", {}),
-            },
-        )
-        logger.info("Initialized Weights & Biases logging")
+        try:
+            wandb.init(
+                project=wandb_cfg["project"],
+                entity=wandb_cfg.get("entity"),
+                name=wandb_cfg.get("name"),
+                tags=wandb_cfg.get("tags", []),
+                notes=wandb_cfg.get("notes"),
+                config={
+                    "model": cfg.get("blip2", {}),
+                    "vit": cfg.get("vit", {}),
+                    "qformer": cfg.get("qformer", {}),
+                    "context": cfg.get("context", {}),
+                    "scoring": cfg.get("scoring", {}),
+                    "normal_stats": cfg.get("normal_stats", {}),
+                    "projection": cfg.get("projection", {}),
+                    "dataset": cfg.get("dataset", {}),
+                    "synthetic": cfg.get("synthetic", {}),
+                    "training": tcfg,
+                    "loss": cfg.get("loss", {}),
+                },
+            )
+            logger.info("Initialized Weights & Biases logging")
+        except Exception as exc:  # noqa: BLE001
+            # Telemetry must never abort a training run. A missing API key used
+            # to raise UsageError out of main() and kill the job before the
+            # first batch.
+            logger.warning(
+                f"wandb disabled ({type(exc).__name__}: {exc}). "
+                "Run `wandb login`, set WANDB_API_KEY, use WANDB_MODE=offline, "
+                "or set wandb.enabled=false to silence this."
+            )
+            use_wandb = False
 
     # ── Train/Val split from train/good (normal-only) ──
     # Unsupervised training: only normal samples, no synthetic anomalies
