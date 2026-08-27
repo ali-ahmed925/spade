@@ -22,8 +22,16 @@ training:
     mode: "max"                            # "max" for AUROC, "min" for loss
     min_delta: 0.001                      # minimum change to qualify as improvement
   checkpoint:
-    degradation_tolerance: 0.02           # Acceptable degradation (e.g., 0.02 = 2% drop is OK)
-                                          # If one metric improves and other degrades <= this, still save
+    # Which metric decides "best". The other is logged but never selected on.
+    # image_auroc is the primary research objective.
+    #
+    # The previous two-metric rule with a degradation tolerance ratcheted: it
+    # saved when the secondary improved and the primary degraded within
+    # tolerance, then reset the reference to the degraded value, so the bar slid
+    # downward while every step reported "new best" (measured: 0.9125 -> 0.8565
+    # on capsule image AUROC).
+    selection_metric: "image_auroc"       # image_auroc | patch_auroc
+    selection_min_delta: 0.0              # required improvement to overwrite
 
 # ── Weights & Biases ──
 wandb:

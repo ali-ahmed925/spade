@@ -445,6 +445,19 @@ def main() -> None:
     best_epoch = -1
     
     # ── Early Stopping ──
+    ckpt_cfg = tcfg.get("checkpoint", {})
+    selection_metric = ckpt_cfg.get("selection_metric", "image_auroc")
+    selection_min_delta = float(ckpt_cfg.get("selection_min_delta", 0.0))
+    if selection_metric not in ("image_auroc", "patch_auroc"):
+        raise ValueError(
+            f"training.checkpoint.selection_metric must be 'image_auroc' or "
+            f"'patch_auroc', got {selection_metric!r}"
+        )
+    logger.info(
+        f"checkpoint selection: {selection_metric} "
+        f"(min_delta={selection_min_delta}); the other metric is reported, not selected on"
+    )
+
     early_stop_cfg = tcfg.get("early_stopping", {})
     early_stopper = None
     if early_stop_cfg.get("enabled", False) and val_loader is not None:
@@ -523,41 +536,33 @@ def main() -> None:
         current_patch = val_metrics["val/patch_auroc"]
         
         # Get degradation tolerance from config (default 0.02 = 2% acceptable drop)
-        degradation_tolerance = tcfg.get("checkpoint", {}).get("degradation_tolerance", 0.02)
         
         if val_loader is not None:
             image_valid = not np.isnan(current_image)
             patch_valid = not np.isnan(current_patch)
             
             if image_valid and patch_valid:
-                image_improved = current_image > best_val_image_auroc
-                patch_improved = current_patch > best_val_patch_auroc
-                image_degraded = current_image < best_val_image_auroc
-                patch_degraded = current_patch < best_val_patch_auroc
-                image_unchanged = current_image == best_val_image_auroc
-                patch_unchanged = current_patch == best_val_patch_auroc
-                
-                # Check if degradation is within acceptable tolerance
-                image_degradation = best_val_image_auroc - current_image if image_degraded else 0.0
-                patch_degradation = best_val_patch_auroc - current_patch if patch_degraded else 0.0
-                image_degradation_acceptable = image_degradation <= degradation_tolerance
-                patch_degradation_acceptable = patch_degradation <= degradation_tolerance
-                
-                # Save checkpoint if:
-                # 1. BOTH metrics improve, OR
-                # 2. One improves and the other stays constant, OR
-                # 3. One improves and the other degrades only slightly (within tolerance)
-                should_save = (
-                    (image_improved and patch_improved) or
-                    (image_improved and patch_unchanged) or
-                    (patch_improved and image_unchanged) or
-                    (image_improved and patch_degradation_acceptable) or
-                    (patch_improved and image_degradation_acceptable)
+                # Selection is on ONE primary metric, with the secondary reported.
+                #
+                # The previous rule saved whenever the secondary metric improved
+                # and the primary degraded within a tolerance, then reassigned the
+                # reference to the DEGRADED value. Each step looked acceptable
+                # while the bar itself slid downward, so a run could drift
+                # 0.9125 -> 0.8565 on image AUROC and still report "new best"
+                # every time. The reference must only ever move up.
+                primary = current_image if selection_metric == "image_auroc" else current_patch
+                secondary = current_patch if selection_metric == "image_auroc" else current_image
+                best_primary = (
+                    best_val_image_auroc if selection_metric == "image_auroc"
+                    else best_val_patch_auroc
                 )
-                
+                should_save = primary > best_primary + selection_min_delta
+
                 if should_save:
-                    best_val_image_auroc = current_image
-                    best_val_patch_auroc = current_patch
+                    # Track each metric's all-time best independently; neither is
+                    # ever lowered, so no tolerance can ratchet downward.
+                    best_val_image_auroc = max(best_val_image_auroc, current_image)
+                    best_val_patch_auroc = max(best_val_patch_auroc, current_patch)
                     best_epoch = epoch
 
                     # Save everything except the frozen backbone, which is
@@ -573,8 +578,11 @@ def main() -> None:
                     best_path = os.path.join(checkpoint_dir, "spade_best.pt")
                     torch.save({
                         "epoch": epoch,
-                        "val_image_auroc": float(best_val_image_auroc),
-                        "val_patch_auroc": float(best_val_patch_auroc),
+                        # the metrics OF THIS MODEL, not the running maxima —
+                        # otherwise a checkpoint advertises a score it does not have
+                        "val_image_auroc": float(current_image),
+                        "val_patch_auroc": float(current_patch),
+                        "selection_metric": selection_metric,
                         "model_state_dict": trainable_state,
                         "optimizer_state_dict": optimizer.state_dict(),
                         "config": {
@@ -589,7 +597,8 @@ def main() -> None:
                         },
                     }, best_path)
                     logger.info(
-                        f"New best metrics @ epoch {epoch} → "
+                        f"New best {selection_metric}={primary:.4f} @ epoch {epoch} "
+                        f"(other metric {secondary:.4f}) → "
                         f"image_auroc={best_val_image_auroc:.4f}, "
                         f"patch_auroc={best_val_patch_auroc:.4f} → saved {best_path}"
                     )
