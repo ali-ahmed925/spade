@@ -114,22 +114,33 @@ def compute_pro(
     if n_normal == 0:
         return float("nan")
 
-    lo, hi = float(scores.min()), float(scores.max())
-    if hi <= lo:
+    normal_scores = flat_scores[normal]
+    if normal_scores.size == 0 or float(scores.max()) <= float(scores.min()):
         return float("nan")
 
-    # Walk thresholds from strict to permissive so FPR increases monotonically
-    # and we can stop as soon as we pass the integration limit.
+    # Sample the FPR AXIS directly, via quantiles of the normal-pixel scores.
+    #
+    # Spacing thresholds evenly over the SCORE RANGE (np.linspace(max, min)) is
+    # wrong for the heavy-tailed maps this model produces: one outlier pixel
+    # pushes almost every threshold above the entire meaningful distribution, the
+    # sweep jumps from FPR~0 past max_fpr in a single step, and the curve is
+    # sampled at essentially no useful points. Measured: a single 5000-valued
+    # pixel dropped PRO from 0.9980 to 0.1500 on an otherwise identical map with
+    # pixel AUROC 1.0000.
+    #
+    # Choosing thresholds as quantiles makes the FPR spacing uniform by
+    # construction and independent of the score scale.
+    target_fprs = np.linspace(0.0, max_fpr, num_thresholds)
+    thresholds = np.quantile(normal_scores, np.clip(1.0 - target_fprs, 0.0, 1.0))
+
     fprs: list[float] = []
     pros: list[float] = []
-    for t in np.linspace(hi, lo, num_thresholds):
+    for t in thresholds:
         pred = flat_scores >= t
         fpr = float((pred & normal).sum()) / n_normal
         pro = float(np.mean([pred[i][idx].mean() for i, idx in components]))
         fprs.append(fpr)
         pros.append(pro)
-        if fpr > max_fpr:
-            break  # keep this point: it is the right endpoint for interpolation
 
     # Anchor at the origin: an empty prediction has zero FPR and zero overlap.
     fprs_arr = np.asarray([0.0] + fprs)

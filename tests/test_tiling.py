@@ -161,3 +161,47 @@ def test_compute_pro_works_without_numpy_trapz(monkeypatch):
     masks[0, 8:16, 8:16] = 1
     scores = masks.astype(float) + np.random.default_rng(0).normal(0, 0.01, masks.shape)
     assert compute_pro(masks, scores) == pytest.approx(1.0, abs=0.05)
+
+
+def test_pro_is_robust_to_score_outliers():
+    """PRO must not depend on the score SCALE, only on the ranking.
+
+    The first implementation spaced thresholds evenly over the score range, so a
+    single extreme pixel pushed almost every threshold above the meaningful part
+    of the distribution and the FPR axis was sampled at nearly no useful points:
+    PRO collapsed 0.9980 -> 0.1500 on an identical, perfectly-ranking map.
+    """
+    import numpy as np
+
+    from utils.metrics import compute_pro
+
+    rng = np.random.default_rng(0)
+    masks = np.zeros((6, 128, 128), np.uint8)
+    scores = rng.normal(0, 1, (6, 128, 128))
+    for i in range(6):
+        for _ in range(3):
+            y, x = rng.integers(10, 110, 2)
+            masks[i, y : y + 12, x : x + 12] = 1
+            scores[i, y : y + 12, x : x + 12] += 12
+
+    without = compute_pro(masks, scores)
+    with_outlier = scores.copy()
+    with_outlier[0, 0, 0] = 5000.0
+    assert compute_pro(masks, with_outlier) == pytest.approx(without, abs=0.02)
+
+
+def test_pro_is_invariant_to_monotone_rescaling():
+    """Any strictly increasing transform of the scores must leave PRO unchanged."""
+    import numpy as np
+
+    from utils.metrics import compute_pro
+
+    rng = np.random.default_rng(1)
+    masks = np.zeros((4, 96, 96), np.uint8)
+    scores = rng.normal(0, 1, (4, 96, 96))
+    masks[:, 20:35, 20:35] = 1
+    scores[:, 20:35, 20:35] += 6
+
+    base = compute_pro(masks, scores)
+    assert compute_pro(masks, scores * 1000.0) == pytest.approx(base, abs=0.02)
+    assert compute_pro(masks, np.exp(scores / 2)) == pytest.approx(base, abs=0.05)
