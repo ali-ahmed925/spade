@@ -606,22 +606,20 @@ def main() -> None:
                         wandb.run.summary["best_val_image_auroc"] = float(best_val_image_auroc)
                         wandb.run.summary["best_val_patch_auroc"] = float(best_val_patch_auroc)
                         wandb.run.summary["best_epoch"] = int(best_epoch)
-                elif image_improved or patch_improved:
-                    # Log when only one metric improves but the other degrades beyond tolerance
-                    if image_improved and patch_degraded and not patch_degradation_acceptable:
-                        logger.info(
-                            f"Image AUROC improved ({current_image:.4f} > {best_val_image_auroc:.4f}), "
-                            f"but patch AUROC degraded too much ({current_patch:.4f} < {best_val_patch_auroc:.4f}, "
-                            f"degradation: {patch_degradation:.4f} > tolerance: {degradation_tolerance:.4f}) - "
-                            f"checkpoint not saved"
-                        )
-                    elif patch_improved and image_degraded and not image_degradation_acceptable:
-                        logger.info(
-                            f"Patch AUROC improved ({current_patch:.4f} > {best_val_patch_auroc:.4f}), "
-                            f"but image AUROC degraded too much ({current_image:.4f} < {best_val_image_auroc:.4f}, "
-                            f"degradation: {image_degradation:.4f} > tolerance: {degradation_tolerance:.4f}) - "
-                            f"checkpoint not saved"
-                        )
+                else:
+                    # Not saved. Reported in terms of the ONE selection metric:
+                    # the previous message described a two-metric tolerance rule
+                    # that no longer exists, and referenced variables that were
+                    # removed with it.
+                    other_best = (
+                        best_val_patch_auroc if selection_metric == "image_auroc"
+                        else best_val_image_auroc
+                    )
+                    logger.info(
+                        f"{selection_metric}={primary:.4f} did not beat best "
+                        f"{best_primary:.4f}; checkpoint not saved "
+                        f"(other metric {secondary:.4f}, its best {other_best:.4f})"
+                    )
 
     if use_wandb:
         wandb.finish()
