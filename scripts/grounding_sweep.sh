@@ -12,6 +12,11 @@
 # Usage:  bash scripts/grounding_sweep.sh wood 0 0.05 0.1 0.5
 
 set -u
+# Python block-buffers stdout when piped, and grep buffers its own output, so a
+# filtered training run can sit silent for minutes. Training output is streamed
+# unfiltered (the tqdm bar IS the live progress); only the eval/D1 summaries are
+# filtered, with --line-buffered so matches appear immediately.
+export PYTHONUNBUFFERED=1
 CATEGORY="${1:?usage: grounding_sweep.sh CATEGORY LAMBDA [LAMBDA...]}"
 shift
 LAMBDAS=("$@")
@@ -29,15 +34,14 @@ for LAM in "${LAMBDAS[@]}"; do
   sed -i "s/^  grounding_weight: .*/  grounding_weight: ${LAM}        # set by grounding_sweep.sh/" config/train.yaml
   sed -i "s|^  checkpoint_dir: .*|  checkpoint_dir: \"./checkpoints_v2_lam${TAG}\"|" config/train.yaml
 
-  python train.py 2>&1 | tee "${OUT}/train_lam${TAG}.log" \
-    | grep -E "QUERY GROUNDING|grounding OFF|Epoch |Val —|New best|did not beat"
+  python train.py 2>&1 | tee "${OUT}/train_lam${TAG}.log"
 
   CKPT="checkpoints_v2_lam${TAG}/${CATEGORY}/spade_best.pt"
 
   # detection: held-out, never used for any selection
   python eval.py --checkpoint "$CKPT" --split heldout 2>&1 \
     | tee "${OUT}/eval_lam${TAG}.log" \
-    | grep -E "Image AUROC|Pixel AUROC|PRO |topk_mean|max "
+    | grep --line-buffered -E "Image AUROC|Pixel AUROC|PRO |topk_mean|max "
 
   # query localisation: val half, compared against the lambda=0 control
   COMPARE=""
@@ -45,7 +49,7 @@ for LAM in "${LAMBDAS[@]}"; do
   python scripts/diagnose_attention.py --category "$CATEGORY" --split val \
     --checkpoint "$CKPT" --json "${OUT}/d1_lam${TAG}.json" $COMPARE 2>&1 \
     | tee "${OUT}/d1_lam${TAG}.log" \
-    | grep -E "TOTAL|saliency|best query|mean |verdict|DEGRADED|before|after"
+    | grep --line-buffered -E "TOTAL|saliency|best query|mean |verdict|DEGRADED|before|after"
 done
 
 # restore the committed defaults so the working tree is not left mutated
