@@ -1,18 +1,30 @@
-"""D1 — do the Q-Former queries encode WHERE the defect is?
+"""D1 — do the Q-Former queries know WHERE the defect is?
 
-Goal 3 (visual tokens that can drive language generation) rests on an untested
-premise: that the learned queries carry spatial defect information. This measures
-it directly, by scoring each component of the anomaly score ON ITS OWN against
-the ground-truth masks.
+Goal 3 (visual tokens driving language generation) rests on a premise that must
+be measured rather than assumed: that the 32 query tokens carry spatial defect
+information. If they do not, any sentence the LLM produces about *where* the
+defect is is unfounded, however fluent it sounds.
 
-    attention-only pixel AUROC ~= 0.5  -> queries know nothing about location
-    attention-only pixel AUROC >> 0.5  -> queries already carry usable signal
+After the feature-space redesign the queries reach the score through the
+contextualiser — every patch attends to all 32 queries — so the thing to measure
+is that attention map, (B, N_patches, 32), scored against the ground-truth masks.
 
-The same decomposition also shows how much each stream contributes to detection,
-which tells us where the headroom is before we spend a training run on it.
+Three readings, each answering a different question:
 
-No training, no gradients. Uses SPADE's own `score_components` output so the
-numbers are exactly the terms the model sums.
+  1. SCORE STREAMS, standalone
+        what each additive term of the score achieves on its own.
+
+  2. QUERY SALIENCY (max over queries) as an anomaly map
+        does patch-to-query attention localise defects at all?
+        ~0.5 -> the queries carry no spatial signal.
+
+  3. PER-QUERY localisation
+        does any INDIVIDUAL query specialise on defects? A query with high
+        pixel AUROC is a defect detector, and its token is the one worth handing
+        to the language model. A flat profile across all 32 means the queries
+        share the work and no single token is groundable.
+
+No training, no gradients.
 """
 
 from __future__ import annotations
@@ -30,29 +42,39 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.mvtec_dataset import MVTecDataset  # noqa: E402
 from eval import load_config  # noqa: E402
 from models.builder import checkpoint_path  # noqa: E402
+from scripts.diagnose_failure import split_indices  # noqa: E402
 from scripts.fit_fine_statistics import build_model  # noqa: E402
 from utils.heatmap import patches_to_heatmap  # noqa: E402
 from utils.logging import get_logger  # noqa: E402
 from utils.metrics import compute_image_auroc, compute_pixel_auroc, compute_pro  # noqa: E402
 
 
-def heldout_indices(n: int, seed: int = 42) -> list[int]:
-    perm = np.random.RandomState(seed).permutation(n).tolist()
-    return perm[n // 2 :]
+def _score_maps(patch_scores, image_size, patch_size, smooth_sigma):
+    return patches_to_heatmap(
+        patch_scores, image_size=image_size, patch_size=patch_size,
+        normalize=False, smooth_sigma=smooth_sigma,
+    )
 
 
 @torch.no_grad()
 def diagnose(model, loader, device, image_size, patch_size, smooth_sigma, logger) -> dict:
-    """Score each component separately and report its standalone performance."""
-    per_component: dict[str, dict[str, list]] = {}
+    streams: dict[str, dict[str, list]] = {}
+    query_maps: list[np.ndarray] = []      # per image: (n_queries, H, W)
+    saliency_maps: list[np.ndarray] = []
     labels: list[int] = []
     masks: list[np.ndarray] = []
+    n_queries = None
 
     for batch in loader:
         images = batch["image"].to(device)
-        out = model(images)
+        out = model(images, return_attention=True)
+
+        # Component names are read from the model, never hardcoded — the old
+        # version of this script assumed "attention"/"spatial_mahalanobis" and
+        # silently reported nothing once the redesign renamed them.
         components = dict(out["score_components"])
         components["TOTAL"] = out["patch_scores"]
+        attention = out.get("patch_query_attention")   # (B, N, Q)
 
         for i in range(images.shape[0]):
             labels.append(int(batch["label"][i]))
@@ -60,39 +82,58 @@ def diagnose(model, loader, device, image_size, patch_size, smooth_sigma, logger
             masks.append(m.numpy() if isinstance(m, torch.Tensor) else m)
 
             for name, tensor in components.items():
-                slot = per_component.setdefault(name, {"image": [], "maps": []})
-                patch_scores = tensor[i].detach().cpu()
+                slot = streams.setdefault(name, {"image": [], "maps": []})
                 slot["image"].append(float(model.get_image_score(tensor[i : i + 1]).cpu()))
                 slot["maps"].append(
-                    patches_to_heatmap(
-                        patch_scores, image_size=image_size, patch_size=patch_size,
-                        normalize=False, smooth_sigma=smooth_sigma,
-                    )
+                    _score_maps(tensor[i].detach().cpu(), image_size, patch_size, smooth_sigma)
+                )
+
+            if attention is not None:
+                attn = attention[i].detach().cpu()            # (N, Q)
+                n_queries = attn.shape[1]
+                saliency_maps.append(
+                    _score_maps(attn.max(dim=1).values, image_size, patch_size, smooth_sigma)
+                )
+                query_maps.append(
+                    np.stack([
+                        _score_maps(attn[:, q], image_size, patch_size, smooth_sigma)
+                        for q in range(n_queries)
+                    ])
                 )
 
     labels_arr = np.array(labels)
     masks_arr = np.stack(masks)
-    results = {}
-    for name, slot in per_component.items():
-        scores = np.array(slot["image"])
-        maps = np.stack(slot["maps"])
-        entry = {"image_auroc": compute_image_auroc(labels_arr, scores)}
-        if masks_arr.max() > 0:
+    has_masks = masks_arr.max() > 0
+
+    results = {"streams": {}, "n_queries": n_queries}
+    for name, slot in streams.items():
+        entry = {"image_auroc": compute_image_auroc(labels_arr, np.array(slot["image"]))}
+        if has_masks:
+            maps = np.stack(slot["maps"])
             entry["pixel_auroc"] = compute_pixel_auroc(masks_arr, maps)
             try:
                 entry["pro"] = compute_pro(masks_arr, maps)
             except Exception:
                 entry["pro"] = float("nan")
-        results[name] = entry
+        results["streams"][name] = entry
+
+    if saliency_maps and has_masks:
+        sal = np.stack(saliency_maps)
+        results["saliency_pixel_auroc"] = compute_pixel_auroc(masks_arr, sal)
+        qm = np.stack(query_maps)                                  # (images, Q, H, W)
+        results["per_query_pixel_auroc"] = [
+            compute_pixel_auroc(masks_arr, qm[:, q]) for q in range(qm.shape[1])
+        ]
     return results
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="D1: what does each score stream know?")
+    parser = argparse.ArgumentParser(description="D1: what do the query tokens know?")
     parser.add_argument("--category", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--smooth-sigma", type=float, default=4.0)
+    parser.add_argument("--split", type=str, default="val", choices=["val", "heldout", "all"])
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--smooth-sigma", type=float, default=None)
     args = parser.parse_args()
 
     cfg = load_config()
@@ -100,44 +141,59 @@ def main() -> None:
     logger = get_logger("D1")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = args.checkpoint or checkpoint_path(cfg, args.category)
+    image_size, patch_size = cfg["vit"]["image_size"], cfg["vit"]["patch_size"]
+    smooth = (
+        args.smooth_sigma if args.smooth_sigma is not None
+        else float(cfg.get("scoring", {}).get("smooth_sigma", 0.0))
+    )
 
-    probe = MVTecDataset(
-        root=cfg["dataset"]["root"], category=args.category, split="test",
-        image_size=cfg["vit"]["image_size"], patch_size=cfg["vit"]["patch_size"],
-        synthetic_method=None,
-    )
-    dataset = MVTecDataset(
-        root=cfg["dataset"]["root"], category=args.category, split="test",
-        image_size=cfg["vit"]["image_size"], patch_size=cfg["vit"]["patch_size"],
-        synthetic_method=None, subset_indices=heldout_indices(len(probe)),
-    )
+    probe = MVTecDataset(root=cfg["dataset"]["root"], category=args.category, split="test",
+                         image_size=image_size, patch_size=patch_size, synthetic_method=None)
+    dataset = MVTecDataset(root=cfg["dataset"]["root"], category=args.category, split="test",
+                           image_size=image_size, patch_size=patch_size, synthetic_method=None,
+                           subset_indices=split_indices(len(probe), args.split))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
-    logger.info(f"category={args.category}  held-out images={len(dataset)}")
+    logger.info(f"category={args.category} split={args.split} images={len(dataset)}")
 
     model = build_model(cfg, checkpoint, device)
-    results = diagnose(
-        model, loader, device,
-        image_size=cfg["vit"]["image_size"], patch_size=cfg["vit"]["patch_size"],
-        smooth_sigma=args.smooth_sigma, logger=logger,
-    )
+    r = diagnose(model, loader, device, image_size, patch_size, smooth, logger)
 
-    print(f"\n{'=' * 78}")
-    print(f"D1  STANDALONE POWER OF EACH SCORE STREAM  —  {args.category}")
-    print(f"{'=' * 78}")
-    print(f"{'stream':<24}{'image AUROC':>14}{'pixel AUROC':>14}{'PRO':>10}")
-    print("-" * 78)
-    order = ["attention", "spatial_mahalanobis", "frequency", "cross", "TOTAL"]
-    for name in order:
-        if name not in results:
-            continue
-        r = results[name]
-        print(f"{name:<24}{r['image_auroc']:>14.4f}"
-              f"{r.get('pixel_auroc', float('nan')):>14.4f}{r.get('pro', float('nan')):>10.4f}")
-    print("-" * 78)
-    attn = results.get("attention", {}).get("pixel_auroc", float("nan"))
-    print(f"attention-only pixel AUROC = {attn:.4f}  "
-          f"({'NO spatial defect signal in the queries' if abs(attn - 0.5) < 0.05 else 'queries carry spatial signal'})")
-    print(f"{'=' * 78}\n")
+    print(f"\n{'=' * 84}")
+    print(f"D1  WHAT THE QUERY TOKENS KNOW  —  {args.category}  (split={args.split})")
+    print(f"{'=' * 84}")
+    print(f"{'score stream':<28}{'image AUROC':>14}{'pixel AUROC':>14}{'PRO':>10}")
+    print("-" * 84)
+    for name, e in r["streams"].items():
+        print(f"{name:<28}{e['image_auroc']:>14.4f}"
+              f"{e.get('pixel_auroc', float('nan')):>14.4f}{e.get('pro', float('nan')):>10.4f}")
+
+    sal = r.get("saliency_pixel_auroc")
+    per_q = r.get("per_query_pixel_auroc")
+    if sal is None or per_q is None:
+        print("\n(no attention returned — model did not provide patch_query_attention)")
+        print(f"{'=' * 84}\n")
+        return
+
+    print(f"\nQUERY ATTENTION AS A LOCALISER  ({r['n_queries']} queries)")
+    print("-" * 84)
+    print(f"  max-over-queries saliency, pixel AUROC : {sal:.4f}")
+    arr = np.array(per_q)
+    order = np.argsort(-arr)
+    print(f"  best query  #{order[0]:<3d} {arr[order[0]]:.4f}      "
+          f"worst query #{order[-1]:<3d} {arr[order[-1]]:.4f}")
+    print(f"  mean {arr.mean():.4f}   std {arr.std():.4f}   "
+          f"(std is how SPECIALISED the queries are)")
+    print(f"  top 5: " + "  ".join(f"#{q}={arr[q]:.3f}" for q in order[:5]))
+    print("-" * 84)
+    best = arr[order[0]]
+    if best > 0.85:
+        verdict = "a query localises defects well — groundable for language"
+    elif best > 0.65:
+        verdict = "partial spatial signal — usable but weak grounding"
+    else:
+        verdict = "NO usable spatial signal in any single query"
+    print(f"  verdict: {verdict}")
+    print(f"{'=' * 84}\n")
 
 
 if __name__ == "__main__":

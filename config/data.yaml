@@ -2,7 +2,7 @@
 dataset:
   name: "mvtec"
   root: "./datasets/mvtec_anomaly_detection"
-  category: "carpet"
+  category: "wood"
   image_size: 448                         # must match vit.image_size (32x32 patch grid)
   num_workers: 4
 
