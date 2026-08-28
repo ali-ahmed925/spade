@@ -32,6 +32,10 @@ training:
     # on capsule image AUROC).
     selection_metric: "image_auroc"       # image_auroc | patch_auroc
     selection_min_delta: 0.0              # required improvement to overwrite
+    # Ties on the primary metric are broken by the other one. Without this a
+    # saturated primary (wood hits val image AUROC 1.0000 at epoch 1) freezes
+    # the checkpoint on the first epoch and discards the rest of training.
+    selection_tie_tol: 1.0e-6
 
 # ── Weights & Biases ──
 wandb:

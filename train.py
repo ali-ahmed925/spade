@@ -26,6 +26,7 @@ from optim.regularizer import clip_gradients
 from utils.logging import get_logger
 from utils.seed import set_seed
 from utils.early_stopping import EarlyStopping
+from utils.selection import should_save_checkpoint
 
 
 def load_config() -> dict:
@@ -483,12 +484,48 @@ def main() -> None:
     logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
     best_val_image_auroc = -float("inf")
     best_val_patch_auroc = -float("inf")
+    # The secondary metric's best AT THE CURRENT PRIMARY LEVEL. Reset whenever
+    # the primary strictly improves, because a higher primary level starts a
+    # fresh race on the secondary.
+    best_secondary_at_primary = -float("inf")
     best_epoch = -1
+
+    def write_checkpoint(path, epoch, image_auroc, patch_auroc):
+        """Save everything except the frozen backbone, restored from BLIP-2.
+
+        The previous allowlist silently dropped state added later (e.g. the
+        stream scale buffers), producing checkpoints that could not reproduce
+        their own scores.
+        """
+        torch.save({
+            "epoch": epoch,
+            # the metrics OF THIS MODEL, not the running maxima — otherwise a
+            # checkpoint advertises a score it does not have
+            "val_image_auroc": float(image_auroc),
+            "val_patch_auroc": float(patch_auroc),
+            "selection_metric": selection_metric,
+            "model_state_dict": {
+                k: v for k, v in model.state_dict().items()
+                if not k.startswith("vision_encoder.")
+            },
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": {
+                "blip2_model_name": cfg["blip2"]["model_name"],
+                "llm_embed_dim": cfg["projection"]["output_dim"],
+                "vit": cfg["vit"],
+                "context": cfg.get("context", {}),
+                "scoring": cfg["scoring"],
+                "normal_stats": cfg["normal_stats"],
+                "descriptor_dim": model.descriptor_dim,
+                "num_patches": model.num_patches,
+            },
+        }, path)
     
     # ── Early Stopping ──
     ckpt_cfg = tcfg.get("checkpoint", {})
     selection_metric = ckpt_cfg.get("selection_metric", "image_auroc")
     selection_min_delta = float(ckpt_cfg.get("selection_min_delta", 0.0))
+    selection_tie_tol = float(ckpt_cfg.get("selection_tie_tol", 1e-6))
     if selection_metric not in ("image_auroc", "patch_auroc"):
         raise ValueError(
             f"training.checkpoint.selection_metric must be 'image_auroc' or "
@@ -505,8 +542,9 @@ def main() -> None:
         logger.info("query grounding OFF (lambda=0) — exact pre-grounding baseline")
 
     logger.info(
-        f"checkpoint selection: {selection_metric} "
-        f"(min_delta={selection_min_delta}); the other metric is reported, not selected on"
+        f"checkpoint selection: {selection_metric} (min_delta={selection_min_delta}), "
+        f"ties within {selection_tie_tol:g} broken by the other metric; "
+        f"spade_last.pt is always written for fixed-budget comparisons"
     )
 
     early_stop_cfg = tcfg.get("early_stopping", {})
@@ -588,77 +626,68 @@ def main() -> None:
                     break
 
         # ── Checkpoint Saving Logic ──
-        # Save checkpoint when:
-        # 1. BOTH metrics improve, OR
-        # 2. One improves and the other stays constant, OR
-        # 3. One improves and the other degrades only slightly (within tolerance)
         current_image = val_metrics["val/image_auroc"]
         current_patch = val_metrics["val/patch_auroc"]
-        
-        # Get degradation tolerance from config (default 0.02 = 2% acceptable drop)
-        
-        if val_loader is not None:
-            image_valid = not np.isnan(current_image)
-            patch_valid = not np.isnan(current_patch)
-            
-            if image_valid and patch_valid:
-                # Selection is on ONE primary metric, with the secondary reported.
-                #
-                # The previous rule saved whenever the secondary metric improved
-                # and the primary degraded within a tolerance, then reassigned the
-                # reference to the DEGRADED value. Each step looked acceptable
-                # while the bar itself slid downward, so a run could drift
-                # 0.9125 -> 0.8565 on image AUROC and still report "new best"
-                # every time. The reference must only ever move up.
-                primary = current_image if selection_metric == "image_auroc" else current_patch
-                secondary = current_patch if selection_metric == "image_auroc" else current_image
-                best_primary = (
-                    best_val_image_auroc if selection_metric == "image_auroc"
-                    else best_val_patch_auroc
-                )
-                should_save = primary > best_primary + selection_min_delta
 
-                if should_save:
-                    # Track each metric's all-time best independently; neither is
-                    # ever lowered, so no tolerance can ratchet downward.
+        if val_loader is not None:
+            primary_is_image = selection_metric == "image_auroc"
+            primary = current_image if primary_is_image else current_patch
+            secondary = current_patch if primary_is_image else current_image
+            secondary_name = "patch_auroc" if primary_is_image else "image_auroc"
+
+            # A NaN secondary must not be able to win a tie-break, but it must
+            # also not block selection on a perfectly valid primary.
+            if np.isnan(secondary):
+                secondary = -float("inf")
+
+            if np.isnan(primary):
+                logger.info(
+                    f"{selection_metric} is NaN this epoch; checkpoint not saved"
+                )
+            else:
+                best_primary = (
+                    best_val_image_auroc if primary_is_image else best_val_patch_auroc
+                )
+
+                # Selection is lexicographic on (primary, secondary).
+                #
+                # Selecting on the primary ALONE deadlocks the moment it
+                # saturates: wood reaches val image AUROC 1.0000 at epoch 1, no
+                # later epoch can exceed it, and every subsequent epoch of
+                # training is discarded — the run keeps the epoch-1 weights
+                # while appearing to train for 20. Ranking ties by the secondary
+                # metric (0.7329 on that same epoch, nowhere near saturated)
+                # keeps selection live without ever lowering the primary bar,
+                # which is what the earlier ratchet bug did.
+                save, improved = should_save_checkpoint(
+                    primary, secondary, best_primary, best_secondary_at_primary,
+                    min_delta=selection_min_delta, tie_tol=selection_tie_tol,
+                )
+                # Strictly below the bar, versus level with it — the two
+                # non-saving cases have different explanations and must not
+                # report the same message.
+                tied = (not improved) and primary >= best_primary - selection_tie_tol
+
+                if save:
+                    # Neither all-time best is ever lowered.
                     best_val_image_auroc = max(best_val_image_auroc, current_image)
                     best_val_patch_auroc = max(best_val_patch_auroc, current_patch)
+                    best_secondary_at_primary = (
+                        secondary if improved
+                        else max(best_secondary_at_primary, secondary)
+                    )
                     best_epoch = epoch
 
-                    # Save everything except the frozen backbone, which is
-                    # restored from the BLIP-2 download. The previous allowlist
-                    # silently dropped any state added later (e.g. the stream
-                    # scale buffers), producing checkpoints that could not
-                    # reproduce their own scores.
-                    trainable_state = {
-                        k: v for k, v in model.state_dict().items()
-                        if not k.startswith("vision_encoder.")
-                    }
-
                     best_path = os.path.join(checkpoint_dir, "spade_best.pt")
-                    torch.save({
-                        "epoch": epoch,
-                        # the metrics OF THIS MODEL, not the running maxima —
-                        # otherwise a checkpoint advertises a score it does not have
-                        "val_image_auroc": float(current_image),
-                        "val_patch_auroc": float(current_patch),
-                        "selection_metric": selection_metric,
-                        "model_state_dict": trainable_state,
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "config": {
-                            "blip2_model_name": cfg["blip2"]["model_name"],
-                            "llm_embed_dim": cfg["projection"]["output_dim"],
-                            "vit": cfg["vit"],
-                            "context": cfg.get("context", {}),
-                            "scoring": cfg["scoring"],
-                            "normal_stats": cfg["normal_stats"],
-                            "descriptor_dim": model.descriptor_dim,
-                            "num_patches": model.num_patches,
-                        },
-                    }, best_path)
+                    write_checkpoint(best_path, epoch, current_image, current_patch)
+
+                    reason = (
+                        f"new best {selection_metric}={primary:.4f}" if improved
+                        else f"{selection_metric} tied at {primary:.4f}, "
+                             f"{secondary_name} improved to {secondary:.4f}"
+                    )
                     logger.info(
-                        f"New best {selection_metric}={primary:.4f} @ epoch {epoch} "
-                        f"(other metric {secondary:.4f}) → "
+                        f"{reason} @ epoch {epoch} → "
                         f"image_auroc={best_val_image_auroc:.4f}, "
                         f"patch_auroc={best_val_patch_auroc:.4f} → saved {best_path}"
                     )
@@ -667,19 +696,23 @@ def main() -> None:
                         wandb.run.summary["best_val_patch_auroc"] = float(best_val_patch_auroc)
                         wandb.run.summary["best_epoch"] = int(best_epoch)
                 else:
-                    # Not saved. Reported in terms of the ONE selection metric:
-                    # the previous message described a two-metric tolerance rule
-                    # that no longer exists, and referenced variables that were
-                    # removed with it.
-                    other_best = (
-                        best_val_patch_auroc if selection_metric == "image_auroc"
-                        else best_val_image_auroc
+                    detail = (
+                        f"did not beat best {best_primary:.4f}" if not tied
+                        else f"tied best {best_primary:.4f} but {secondary_name}="
+                             f"{secondary:.4f} did not beat {best_secondary_at_primary:.4f}"
                     )
                     logger.info(
-                        f"{selection_metric}={primary:.4f} did not beat best "
-                        f"{best_primary:.4f}; checkpoint not saved "
-                        f"(other metric {secondary:.4f}, its best {other_best:.4f})"
+                        f"{selection_metric}={primary:.4f} {detail}; checkpoint not saved"
                     )
+
+        # The final-epoch weights, saved unconditionally. Comparing two training
+        # runs through `spade_best.pt` confounds the thing being compared with
+        # which epoch each run happened to peak on; `spade_last.pt` gives every
+        # arm of an ablation an identical update budget.
+        write_checkpoint(
+            os.path.join(checkpoint_dir, "spade_last.pt"),
+            epoch, current_image, current_patch,
+        )
 
     if use_wandb:
         wandb.finish()
