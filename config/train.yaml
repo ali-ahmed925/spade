@@ -57,6 +57,25 @@ loss:
   use_pseudo: true           # Use pseudo-anomaly loss for contrastive learning
   pseudo_epsilon: 0.01       # Perturbation magnitude (applied to EMBEDDINGS)
   pseudo_margin: 0.1         # Perturbed patches must score this much higher
+
+  # ── Auxiliary query grounding ──
+  # Makes reserved query tokens attend to anomalous regions, so the tokens the
+  # language component consumes actually encode WHERE the defect is. D1 measured
+  # that they currently do not: on wood, mean per-query pixel AUROC 0.5093
+  # (chance), best query 0.6309.
+  #
+  # Synthetic CutPaste/Crack anomalies are used ONLY as a source of patch masks.
+  # The detection objective and the normal-only Mahalanobis statistics are
+  # untouched — the anomaly score never sees a synthetic label, and synthetic
+  # patches are excluded from both the statistics and the detection loss.
+  #
+  # grounding_weight: 0.0 disables the whole path and is the EXACT baseline
+  # control — no synthetic images are generated, so training is bit-identical
+  # to a pre-grounding run.
+  grounding_weight: 0.0        # lambda; try 0.05 / 0.1 / 0.5 in a sweep
+  grounding_queries: 4         # leading query tokens reserved for anomalies
+  grounding_synthetic_prob: 0.5  # fraction of training images given a synthetic defect
+  grounding_pos_weight: "auto"   # anomalous patches are a small minority
   clamp_max: 100.0            # Maximum score for soft clipping
 
 

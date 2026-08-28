@@ -134,6 +134,10 @@ def main() -> None:
     parser.add_argument("--split", type=str, default="val", choices=["val", "heldout", "all"])
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--smooth-sigma", type=float, default=None)
+    parser.add_argument("--json", type=str, default=None,
+                        help="write results here, for before/after comparison")
+    parser.add_argument("--compare", type=str, default=None,
+                        help="a previous --json file to diff against")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -193,6 +197,55 @@ def main() -> None:
     else:
         verdict = "NO usable spatial signal in any single query"
     print(f"  verdict: {verdict}")
+
+    payload = {
+        "category": args.category,
+        "split": args.split,
+        "checkpoint": checkpoint,
+        "streams": r["streams"],
+        "saliency_pixel_auroc": sal,
+        "per_query_pixel_auroc": per_q,
+        "best_query": int(order[0]),
+        "best_query_auroc": float(best),
+        "query_mean": float(arr.mean()),
+        "query_std": float(arr.std()),
+    }
+
+    if args.compare:
+        import json as _json
+
+        with open(args.compare) as fh:
+            before = _json.load(fh)
+        print(f"\nBEFORE vs AFTER  (before: {args.compare})")
+        print("-" * 84)
+        print(f"{'metric':<34}{'before':>12}{'after':>12}{'delta':>12}")
+        rows = [
+            ("image AUROC (TOTAL)", before["streams"]["TOTAL"]["image_auroc"],
+             r["streams"]["TOTAL"]["image_auroc"]),
+            ("pixel AUROC (TOTAL)", before["streams"]["TOTAL"].get("pixel_auroc"),
+             r["streams"]["TOTAL"].get("pixel_auroc")),
+            ("PRO (TOTAL)", before["streams"]["TOTAL"].get("pro"),
+             r["streams"]["TOTAL"].get("pro")),
+            ("query saliency pixel AUROC", before["saliency_pixel_auroc"], sal),
+            ("best-query pixel AUROC", before["best_query_auroc"], float(best)),
+            ("query specialisation (std)", before["query_std"], float(arr.std())),
+        ]
+        for name, b, a in rows:
+            if b is None or a is None:
+                continue
+            flag = ""
+            if "AUROC (TOTAL)" in name or "PRO" in name:
+                flag = "  <-- DETECTION DEGRADED" if a < b - 0.005 else ""
+            print(f"{name:<34}{b:>12.4f}{a:>12.4f}{a - b:>+12.4f}{flag}")
+        print("-" * 84)
+
+    if args.json:
+        import json as _json
+
+        with open(args.json, "w") as fh:
+            _json.dump(payload, fh, indent=2)
+        print(f"\nwrote {args.json}")
+
     print(f"{'=' * 84}\n")
 
 

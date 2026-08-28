@@ -55,10 +55,13 @@ def train_one_epoch(
     # Keep ViT in eval mode (frozen + BatchNorm/Dropout behaviour)
     model.vision_encoder.eval()
 
-    running = {"total": 0.0, "patch": 0.0}
+    running = {"total": 0.0, "patch": 0.0, "detection": 0.0}
     # Add pseudo key if using normal-only training with pseudo-anomaly loss
     if not cfg["synthetic"].get("enabled", False) and cfg.get("loss", {}).get("use_pseudo", False):
         running["pseudo"] = 0.0
+    if criterion.grounding_loss_fn is not None:
+        running["grounding"] = 0.0
+    last_grounding_diagnostics: dict[str, float] = {}
     num_batches = 0
     global_step = (epoch - 1) * len(loader)
 
@@ -78,11 +81,13 @@ def train_one_epoch(
         perturb_epsilon = None
         if criterion.pseudo_loss_fn is not None:
             perturb_epsilon = criterion.pseudo_loss_fn.epsilon
+        needs_attention = criterion.grounding_loss_fn is not None
         outputs = model(
             images,
             patch_labels=patch_labels,
             update_stats=True,  # Update normal statistics during training
             perturb_epsilon=perturb_epsilon,
+            return_attention=needs_attention,
         )
         
         # ⚠️ CRITICAL: Verify HPA is actually affecting patch scores during training
@@ -109,6 +114,7 @@ def train_one_epoch(
             query_embeds=outputs["query_embeds"],
             labels=labels,  # All zeros for normal-only training
             patch_scores_perturbed=outputs.get("patch_scores_perturbed"),
+            patch_query_attention=outputs.get("patch_query_attention"),
         )
 
         # Backward
@@ -139,7 +145,9 @@ def train_one_epoch(
         # Accumulate (handle optional keys like "pseudo")
         for k in running:
             if k in losses:
-                running[k] += losses[k].item()
+                running[k] += float(losses[k].detach())
+        if "grounding_diagnostics" in losses:
+            last_grounding_diagnostics = losses["grounding_diagnostics"]
         num_batches += 1
         
         # Clear intermediate tensors
@@ -160,6 +168,8 @@ def train_one_epoch(
                 log_dict = {
                     "train/loss_total": running["total"] / num_batches,
                     "train/loss_patch": running["patch"] / num_batches,
+                    "train/loss_detection": running["detection"] / num_batches,
+                    "train/grounding_lambda": criterion.grounding_weight,
                     "train/learning_rate": scheduler.get_last_lr()[0],
                     "train/gradient_norm": grad_norm,
                     "train/epoch": epoch,
@@ -168,9 +178,16 @@ def train_one_epoch(
                 # Add pseudo loss if available
                 if "pseudo" in running:
                     log_dict["train/loss_pseudo"] = running["pseudo"] / num_batches
+                if "grounding" in running:
+                    log_dict["train/loss_grounding"] = running["grounding"] / num_batches
+                    log_dict.update({f"train/{k}": v for k, v in last_grounding_diagnostics.items()})
                 wandb.log(log_dict, step=current_step)
 
-    return {k: v / max(num_batches, 1) for k, v in running.items()}
+    summary = {k: v / max(num_batches, 1) for k, v in running.items()}
+    if criterion.grounding_loss_fn is not None:
+        summary["grounding_lambda"] = criterion.grounding_weight
+        summary.update(last_grounding_diagnostics)
+    return summary
 
 @torch.no_grad()
 def validate(
@@ -266,12 +283,22 @@ def main() -> None:
     # ── Train/Val split from train/good (normal-only) ──
     # Unsupervised training: only normal samples, no synthetic anomalies
     use_synthetic = cfg["synthetic"].get("enabled", False)
+    grounding_weight = float(cfg.get("loss", {}).get("grounding_weight", 0.0))
+    grounding_enabled = grounding_weight > 0.0
+
+    # Synthetic anomalies serve two DIFFERENT purposes and must not be confused:
+    #   synthetic.enabled      -> supervised detection (replaces the objective)
+    #   grounding_weight > 0   -> masks ONLY, for the auxiliary attention loss;
+    #                             the detection objective stays unsupervised
+    # At grounding_weight == 0 no synthetic images are generated at all, so the
+    # run is bit-identical to a pre-grounding one.
+    synthetic_method = None  # None = auto-select per category
     if use_synthetic:
-        synthetic_method = None  # None = auto-select based on category
         synthetic_prob = cfg["synthetic"].get("synthetic_prob", 0.2)
+    elif grounding_enabled:
+        synthetic_prob = float(cfg["loss"].get("grounding_synthetic_prob", 0.5))
     else:
-        synthetic_method = None  # None = no synthetic anomalies
-        synthetic_prob = 0.0  # No synthetic anomalies
+        synthetic_prob = 0.0
     
     base_train = MVTecDataset(
         root=cfg["dataset"]["root"],
@@ -438,6 +465,9 @@ def main() -> None:
             pseudo_epsilon=loss_cfg.get("pseudo_epsilon", 0.01),
             pseudo_margin=loss_cfg.get("pseudo_margin", 0.1),
             clamp_max=loss_cfg.get("clamp_max", 100.0),
+            grounding_weight=grounding_weight,
+            grounding_queries=loss_cfg.get("grounding_queries", 4),
+            grounding_pos_weight=loss_cfg.get("grounding_pos_weight", "auto"),
         )
         logger.info(
             f"Using Mahalanobis clustering loss for normal-only training "
@@ -464,6 +494,16 @@ def main() -> None:
             f"training.checkpoint.selection_metric must be 'image_auroc' or "
             f"'patch_auroc', got {selection_metric!r}"
         )
+    if grounding_enabled:
+        logger.info(
+            f"QUERY GROUNDING ON: lambda={grounding_weight}, "
+            f"{cfg['loss'].get('grounding_queries', 4)} reserved queries, "
+            f"synthetic_prob={synthetic_prob} (masks only — the detection "
+            f"objective and the normal-only statistics are unchanged)"
+        )
+    else:
+        logger.info("query grounding OFF (lambda=0) — exact pre-grounding baseline")
+
     logger.info(
         f"checkpoint selection: {selection_metric} "
         f"(min_delta={selection_min_delta}); the other metric is reported, not selected on"
@@ -484,11 +524,20 @@ def main() -> None:
         metrics = train_one_epoch(
             model, loader, criterion, optimizer, scheduler, device, epoch, cfg, logger, use_wandb,
         )
-        logger.info(
+        epoch_line = (
             f"Epoch {epoch}/{tcfg['epochs']} — "
             f"loss: {metrics['total']:.4f} | "
+            f"detection: {metrics['detection']:.4f} | "
             f"patch: {metrics['patch']:.4f}"
         )
+        if "grounding" in metrics:
+            epoch_line += (
+                f" | grounding: {metrics['grounding']:.4f} (lambda={criterion.grounding_weight})"
+                f" | attn mass normal/anomalous: "
+                f"{metrics.get('grounding/mass_on_normal', float('nan')):.3f}/"
+                f"{metrics.get('grounding/mass_on_anomalous', float('nan')):.3f}"
+            )
+        logger.info(epoch_line)
 
         # ── Validation (real test anomalies or synthetic) ──
         if val_loader is not None:

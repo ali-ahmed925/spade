@@ -8,6 +8,7 @@ Supports two modes:
 import torch
 import torch.nn as nn
 
+from losses.grounding_loss import QueryGroundingLoss
 from losses.patch_loss import PatchBCELoss, FocalLoss
 from losses.patch_loss_normal import MahalanobisPatchLoss, PseudoAnomalyLoss
 
@@ -33,6 +34,10 @@ class TotalLoss(nn.Module):
         pseudo_epsilon: float = 0.01,
         pseudo_margin: float = 0.1,
         clamp_max: float = 100.0,
+        # ── auxiliary query grounding ──
+        grounding_weight: float = 0.0,
+        grounding_queries: int = 4,
+        grounding_pos_weight: float | str = "auto",
     ) -> None:
         """
         Args:
@@ -49,6 +54,19 @@ class TotalLoss(nn.Module):
         super().__init__()
         self.patch_weight = patch_weight
         self.use_normal_only = use_normal_only
+
+        # Auxiliary objective on the patch->query attention map. It does NOT
+        # touch the detection term: the anomaly score never sees a synthetic
+        # label. weight == 0 disables it entirely, which is the exact control
+        # for any comparison.
+        self.grounding_weight = float(grounding_weight)
+        self.grounding_loss_fn = (
+            QueryGroundingLoss(
+                n_anomaly_queries=grounding_queries, pos_weight=grounding_pos_weight
+            )
+            if self.grounding_weight > 0
+            else None
+        )
 
         if use_normal_only:
             # Normal-only training: Mahalanobis clustering loss
@@ -76,6 +94,7 @@ class TotalLoss(nn.Module):
         query_embeds: torch.Tensor,
         labels: torch.Tensor,
         patch_scores_perturbed: torch.Tensor | None = None,
+        patch_query_attention: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -101,7 +120,9 @@ class TotalLoss(nn.Module):
             # scored a perturbed copy of the patches (perturb_epsilon != None);
             # scoring-level perturbation cancels and has zero gradient.
             if self.pseudo_loss_fn is not None:
-                l_pseudo = self.pseudo_loss_fn(patch_scores, patch_scores_perturbed)
+                l_pseudo = self.pseudo_loss_fn(
+                    patch_scores, patch_scores_perturbed, patch_targets
+                )
                 result["pseudo"] = l_pseudo
                 result["total"] = result["total"] + l_pseudo
         else:
@@ -113,5 +134,22 @@ class TotalLoss(nn.Module):
                 "total": total,
                 "patch": l_patch,
             }
-        
+
+        # ── auxiliary grounding, added to BOTH branches ──
+        # Gradients flow through the contextualizer into the Q-Former, so the
+        # query tokens actually learn; the detection term above is unchanged.
+        result["detection"] = result["total"]
+        if self.grounding_loss_fn is not None:
+            if patch_query_attention is None:
+                raise ValueError(
+                    "grounding_weight > 0 but no patch_query_attention was passed. "
+                    "Call SPADE.forward(..., return_attention=True)."
+                )
+            l_ground, diagnostics = self.grounding_loss_fn(
+                patch_query_attention, patch_targets
+            )
+            result["grounding"] = l_ground
+            result["grounding_diagnostics"] = diagnostics
+            result["total"] = result["total"] + self.grounding_weight * l_ground
+
         return result

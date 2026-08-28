@@ -33,7 +33,16 @@ class MahalanobisPatchLoss(nn.Module):
         """
         Args:
             scores: (B, N) Mahalanobis distances per patch
-            targets: not used (placeholder for API compatibility)
+            targets: (B, N) patch labels, or None. When the query-grounding
+                objective is active the batch contains SYNTHETIC anomalies (used
+                only for their masks), and this loss must not be applied to those
+                patches: minimizing the Mahalanobis distance of a patch that is
+                deliberately anomalous teaches the model that the anomaly is
+                normal. Patches with target != 0 are therefore excluded.
+
+                With grounding off there are no synthetic anomalies, every label
+                is 0, and the mask is a no-op — so lambda=0 reproduces the
+                pre-grounding loss exactly.
         Returns:
             scalar loss
         """
@@ -41,13 +50,21 @@ class MahalanobisPatchLoss(nn.Module):
         # scores / (1 + scores/scale) smoothly saturates to scale
         scale = self.clamp_max
         scores_clipped = scores / (1.0 + scores / scale)
-        
+
+        if targets is not None:
+            normal = targets.to(scores_clipped.dtype) == 0
+            if not bool(normal.all()):
+                selected = scores_clipped[normal]
+                if selected.numel() == 0:
+                    return scores_clipped.sum() * 0.0
+                return selected.mean() + self.lambda_var * selected.var()
+
         # Mean distance (encourages small distances for normal patches)
         mean_loss = scores_clipped.mean()
-        
+
         # Variance of distances (encourages tight cluster - all patches similar distance)
         var_loss = scores_clipped.var()
-        
+
         total_loss = mean_loss + self.lambda_var * var_loss
         return total_loss
 
@@ -91,6 +108,7 @@ class PseudoAnomalyLoss(nn.Module):
         self,
         scores: torch.Tensor,
         perturbed_scores: torch.Tensor,
+        patch_labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -109,5 +127,14 @@ class PseudoAnomalyLoss(nn.Module):
                 "returns 'patch_scores_perturbed'."
             )
         # want: perturbed >= clean + margin
-        violation = self.margin - (perturbed_scores - scores)
-        return F.relu(violation).mean()
+        violation = F.relu(self.margin - (perturbed_scores - scores))
+
+        # Same exclusion as MahalanobisPatchLoss: a synthetic-anomalous patch is
+        # not a "clean" reference to perturb away from. No-op when no synthetic
+        # anomalies are present.
+        if patch_labels is not None:
+            normal = patch_labels.to(violation.dtype) == 0
+            if not bool(normal.all()):
+                selected = violation[normal]
+                return selected.mean() if selected.numel() else violation.sum() * 0.0
+        return violation.mean()
