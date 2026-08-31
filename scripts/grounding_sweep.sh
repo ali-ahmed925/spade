@@ -63,6 +63,8 @@ for LAM in "${LAMBDAS[@]}"; do
     python eval.py --checkpoint "$CKPT" --split heldout 2>&1 \
       | tee "${OUT}/eval_${WHICH}_lam${TAG}.log" \
       | grep --line-buffered -E "Image AUROC|Pixel AUROC|PRO |topk_mean|max "
+    grep -q "Image AUROC" "${OUT}/eval_${WHICH}_lam${TAG}.log" \
+      || echo "[sweep] WARNING: eval produced no metrics for lambda=${LAM} ${WHICH} — see the log"
   done
 
   # Query localisation on the fixed-budget checkpoint, diffed against the
@@ -71,10 +73,13 @@ for LAM in "${LAMBDAS[@]}"; do
   COMPARE=""
   [ -f "${OUT}/d1_last_lam0.json" ] && [ "$TAG" != "0" ] && COMPARE="--compare ${OUT}/d1_last_lam0.json"
   echo "---- lambda=${LAM}  last  query localisation (val) ----"
+  # Unfiltered: a traceback matches none of the summary patterns, so filtering
+  # here turns a crashed measurement into a silent blank column.
   python scripts/diagnose_attention.py --category "$CATEGORY" --split val \
     --checkpoint "$CKPT" --json "${OUT}/d1_last_lam${TAG}.json" $COMPARE 2>&1 \
-    | tee "${OUT}/d1_last_lam${TAG}.log" \
-    | grep --line-buffered -E "TOTAL|saliency|best query|mean |verdict|DEGRADED|before|after"
+    | tee "${OUT}/d1_last_lam${TAG}.log"
+  [ -f "${OUT}/d1_last_lam${TAG}.json" ] \
+    || echo "[sweep] WARNING: D1 wrote no JSON for lambda=${LAM} — see ${OUT}/d1_last_lam${TAG}.log"
 done
 
 summary () {
