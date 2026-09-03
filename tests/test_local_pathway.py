@@ -229,3 +229,70 @@ def test_closed_form_fit_is_order_invariant():
 
     assert torch.allclose(a.mu, b.mu, atol=1e-4)
     assert torch.allclose(a.sigma_inv, b.sigma_inv, atol=1e-2)
+
+
+# ── feature geometry diagnostics ─────────────────────────────────────────
+def test_effective_rank_detects_removed_directions():
+    """The failure kNN cannot tolerate: variance concentrated into a subspace,
+    so a defect along a removed direction becomes invisible."""
+    from models.normal_fit import feature_geometry
+
+    torch.manual_seed(0)
+    isotropic = feature_geometry(torch.randn(4000, 32))
+    degenerate = feature_geometry(torch.randn(4000, 3) @ torch.randn(3, 32))
+
+    assert isotropic["effective_rank"] > 30
+    assert degenerate["effective_rank"] < 4
+
+
+def test_norm_and_rank_are_independent_signals():
+    """Uniform shrinkage and direction removal are different failures and must
+    not be confused: the score is normalised by scale, so only rank loss is
+    fatal."""
+    from models.normal_fit import feature_geometry
+
+    torch.manual_seed(0)
+    base = torch.randn(4000, 32)
+    full = feature_geometry(base)
+    shrunk = feature_geometry(base * 0.01)
+
+    assert shrunk["norm"] < full["norm"] / 50, "shrinkage must show in the norm"
+    assert abs(shrunk["effective_rank"] - full["effective_rank"]) < 1.0, (
+        "uniform shrinkage must NOT register as rank loss"
+    )
+
+
+def test_mahalanobis_loss_cannot_be_reduced_by_reshaping_features():
+    """The identity that invalidates the 'collapse objective' reading:
+    E[(x-mu)' S^-1 (x-mu)] = trace(S^-1 S) = D, for ANY distribution, when S is
+    the sample covariance of the same data. Scale and multimodality are both
+    irrelevant. What the loss CAN exploit is stale statistics."""
+    torch.manual_seed(0)
+    dim = 24
+
+    def mean_distance(x):
+        scorer = MahalanobisScoring(feature_dim=dim, regularization=1e-8, gamma=1.0)
+        scorer.fit_from_normal_patches(x)
+        return float(scorer(x.unsqueeze(0)).mean())
+
+    base = torch.randn(8000, dim) @ torch.randn(dim, dim)
+    two_modes = torch.cat([torch.randn(4000, dim), torch.randn(4000, dim) + 30.0])
+
+    assert mean_distance(base) == pytest.approx(dim, rel=0.02)
+    assert mean_distance(base * 100) == pytest.approx(dim, rel=0.02)
+    assert mean_distance(two_modes) == pytest.approx(dim, rel=0.02)
+
+
+def test_stale_statistics_create_a_shrinkage_incentive():
+    """The gradient that DOES reach fusion: with Sigma_inv refit only every 100
+    steps, halving the features between refits drops the loss ~4x."""
+    torch.manual_seed(0)
+    dim = 24
+    x = torch.randn(8000, dim) @ torch.randn(dim, dim)
+
+    scorer = MahalanobisScoring(feature_dim=dim, regularization=1e-8, gamma=1.0)
+    scorer.fit_from_normal_patches(x)                     # statistics fitted on x
+
+    matched = float(scorer(x.unsqueeze(0)).mean())
+    halved = float(scorer((x * 0.5).unsqueeze(0)).mean())
+    assert halved == pytest.approx(matched / 4, rel=0.05)

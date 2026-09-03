@@ -92,6 +92,41 @@ def collect_normal_features(
 
 
 @torch.no_grad()
+def feature_geometry(features: torch.Tensor) -> dict[str, float]:
+    """Measure whether the trained features still have usable structure.
+
+    kNN needs the normal set to stay STRUCTURED -- head, shaft and background
+    patches occupying distinct regions. Two ways that can be lost, and this
+    separates them:
+
+      * `norm`: mean L2 length. The detection loss cannot be reduced by
+        reshaping the features (mean Mahalanobis distance over the fitting set
+        equals the dimension, exactly, for any distribution) -- but it CAN be
+        reduced by shrinking them faster than the statistics refit tracks. A
+        2x shrink between refits drops the loss 4x. If this falls across
+        epochs, that treadmill is running.
+
+      * `effective_rank`: participation ratio of the covariance spectrum,
+        (sum L)^2 / sum L^2. Equals D for an isotropic distribution and falls
+        toward 1 as variance concentrates into fewer directions. This is the
+        one that matters: a defect living along a removed direction becomes
+        invisible to a nearest-neighbour search.
+
+    Both are diagnostics. Neither is optimised for.
+    """
+    x = features.float()
+    centered = x - x.mean(dim=0, keepdim=True)
+    n, d = centered.shape
+    eigenvalues = torch.linalg.svdvals(centered).pow(2) / max(n - 1, 1)
+    total = eigenvalues.sum().clamp_min(1e-12)
+    return {
+        "norm": float(x.norm(dim=1).mean()),
+        "effective_rank": float(total.pow(2) / eigenvalues.pow(2).sum().clamp_min(1e-12)),
+        "dim": float(d),
+    }
+
+
+@torch.no_grad()
 def fit_normal_model(
     model,
     loader: DataLoader,
@@ -152,5 +187,34 @@ def fit_normal_model(
     model.mahal_scale.fill_(float(contextual.mean().clamp_min(1e-8)))
     model.stream_scales_initialized.fill_(True)
     report["mahal_scale"] = float(model.mahal_scale)
+
+    # ── geometry diagnostics ──
+    # Whether trained fusion is better or worse than raw ViT features for kNN is
+    # an empirical question these numbers answer directly, rather than one to
+    # argue about from the shape of the loss.
+    sample = features["descriptors"][: min(20_000, features["descriptors"].shape[0])]
+    context_geometry = feature_geometry(sample)
+    report["descriptor_norm"] = context_geometry["norm"]
+    report["descriptor_effective_rank"] = context_geometry["effective_rank"]
+
+    if "local" in features and model.local_enabled:
+        local_sample = features["local"][: min(20_000, features["local"].shape[0])]
+        local_geometry = feature_geometry(local_sample)
+        report["local_norm"] = local_geometry["norm"]
+        report["local_effective_rank"] = local_geometry["effective_rank"]
+
+        # The only route by which the detection loss can rescale the fused
+        # features: LayerNorm pins each descriptor to unit variance, so a
+        # uniform shrink has to come through this learnable gain.
+        gain = getattr(getattr(model.fusion, "out_norm", None), "weight", None)
+        if gain is not None:
+            report["fusion_gain"] = float(gain.detach().abs().mean())
+
+        if logger is not None:
+            logger.info(
+                f"geometry: local norm {report['local_norm']:.3f}, "
+                f"effective rank {report['local_effective_rank']:.1f}/{local_geometry['dim']:.0f}"
+                + (f", fusion gain {report['fusion_gain']:.4f}" if gain is not None else "")
+            )
 
     return report
