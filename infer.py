@@ -22,7 +22,7 @@ from data.transforms import get_eval_transforms
 from models.builder import describe, load_spade
 from models.llm import FrozenLLM
 from utils.heatmap import patches_to_heatmap, overlay_heatmap, save_heatmap
-from utils.logging import get_logger
+from utils.logging import get_logger, run_log_path
 
 
 def load_config() -> dict:
@@ -45,7 +45,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    logger = get_logger("infer")
+    logger = get_logger(
+        "infer", log_file=run_log_path("infer", cfg["dataset"]["category"])
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     image_size = cfg["vit"]["image_size"]
     patch_size = cfg["vit"]["patch_size"]

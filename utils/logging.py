@@ -1,8 +1,26 @@
 """Lightweight logging helpers."""
 
 import logging
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
+
+
+def run_log_path(kind: str, category: str | None = None) -> str:
+    """A unique log file per run: logs/<kind>/<category>_<timestamp>.log.
+
+    Every entry point writes one. Terminal scrollback is not a record -- a lost
+    tmux session took a full sweep's output with it once, and a single appended
+    logs/train.log interleaves every category and every run into one file that
+    cannot be read back per-experiment.
+
+    SPADE_LOG_DIR overrides the root for a run that should log elsewhere.
+    """
+    root = Path(os.environ.get("SPADE_LOG_DIR", "logs")) / kind
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"{category}_{stamp}.log" if category else f"{stamp}.log"
+    return str(root / name)
 
 
 def get_logger(name: str, log_file: str | None = None) -> logging.Logger:

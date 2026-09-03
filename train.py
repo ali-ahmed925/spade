@@ -23,7 +23,7 @@ from models.spade import SPADE
 from optim.optimizer import build_optimizer
 from optim.scheduler import build_scheduler
 from optim.regularizer import clip_gradients
-from utils.logging import get_logger
+from utils.logging import get_logger, run_log_path
 from utils.seed import set_seed
 from utils.early_stopping import EarlyStopping
 from utils.selection import should_save_checkpoint
@@ -240,7 +240,9 @@ def main() -> None:
     tcfg = cfg["training"]
     set_seed(tcfg["seed"])
 
-    logger = get_logger("train", log_file="logs/train.log")
+    logger = get_logger(
+        "train", log_file=run_log_path("train", cfg["dataset"]["category"])
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 

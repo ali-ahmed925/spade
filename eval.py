@@ -24,7 +24,7 @@ from data.mvtec_dataset import MVTecDataset
 from models.builder import checkpoint_path, describe, load_spade
 from models.spade import SPADE
 from utils.heatmap import patches_to_heatmap, overlay_heatmap, save_heatmap
-from utils.logging import get_logger
+from utils.logging import get_logger, run_log_path
 from utils.metrics import compute_image_auroc, compute_pixel_auroc, compute_pro
 from models.tiling import (
     crops_from_image,
@@ -487,7 +487,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
-    logger = get_logger("eval")
+    logger = get_logger(
+        "eval", log_file=run_log_path("eval", cfg["dataset"]["category"])
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── Organize outputs by category ──
