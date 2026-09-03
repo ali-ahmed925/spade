@@ -46,6 +46,8 @@ import torch
 import torch.nn as nn
 from transformers import Blip2Model
 
+from models.memory_bank import CoresetMemoryBank
+from models.neighborhood import NeighborhoodAggregator
 from models.feature_fusion import MultiLayerPatchFusion, QueryPatchContextualizer
 from models.mahalanobis_scoring import MahalanobisScoring
 from models.normal_statistics import NormalStatisticsTracker
@@ -79,6 +81,12 @@ class SPADE(nn.Module):
         mahalanobis_reg: float = 1e-4,
         normalize_streams: bool = True,
         image_aggregation: str = "topk_mean",
+        # ── local detection pathway ──
+        local_enabled: bool = True,
+        local_source: str = "fused",
+        local_neighborhood: int = 3,
+        score_w_local: float = 1.0,
+        memory_bank_cfg: dict | None = None,
         # ── normal statistics ──
         normal_stats_buffer_size: int = 20000,
         normal_stats_update_frequency: int = 100,
@@ -131,6 +139,31 @@ class SPADE(nn.Module):
         )
         self.descriptor_dim = self.contextualizer.output_dim
 
+        # ── LOCAL detection pathway ──
+        # The contextualizer OVERWRITES rather than augments: the only thing
+        # Mahalanobis ever sees is [local | context], where the context half is
+        # attention over 32 image-level tokens and is near-constant across
+        # patches within an image. Under one pooled Gaussian that half varies
+        # between images but not between patches, so it inflates Sigma without
+        # adding discrimination -- and no raw local appearance reaches the score
+        # without passing through global mixing first.
+        #
+        # This pathway runs in parallel and never touches the contextualizer.
+        if local_source not in ("fused", "raw"):
+            raise ValueError(f"local_source must be 'fused' or 'raw', got {local_source!r}")
+        self.local_enabled = bool(local_enabled)
+        self.local_source = local_source
+        self.local_dim = (
+            self.fusion.output_dim if local_source == "fused"
+            else vit_dim * len(self.vision_encoder.feature_layers)
+        )
+        self.neighborhood = NeighborhoodAggregator(
+            grid_size=self.grid_size, kernel_size=local_neighborhood
+        )
+        self.memory_bank = CoresetMemoryBank(
+            feature_dim=self.local_dim, **(memory_bank_cfg or {})
+        )
+
         # ── scoring over descriptors ──
         self.mahalanobis_scorer = MahalanobisScoring(
             feature_dim=self.descriptor_dim,
@@ -153,6 +186,7 @@ class SPADE(nn.Module):
         self.image_aggregation = image_aggregation
         self.score_beta = score_beta
         self.score_gamma = score_gamma
+        self.score_w_local = score_w_local
 
         # ── stream scaling ──
         # One global constant per stream, EMA-estimated during training and held
@@ -161,6 +195,9 @@ class SPADE(nn.Module):
         self.normalize_streams = normalize_streams
         self.register_buffer("mahal_scale", torch.ones(()))
         self.register_buffer("freq_scale", torch.ones(()))
+        # Fitted alongside the bank, not EMA'd: the bank does not exist during
+        # training, so there is nothing to average over.
+        self.register_buffer("local_scale", torch.ones(()))
         self.register_buffer("stream_scales_initialized", torch.tensor(False))
         self.stream_scale_momentum = 0.05
 
@@ -205,12 +242,26 @@ class SPADE(nn.Module):
         out = {"descriptors": descriptors, "query_embeds": query_embeds}
         if attention is not None:
             out["patch_query_attention"] = attention
+
+        # The local pathway branches HERE, before the contextualizer, so nothing
+        # global is mixed in. Neighbourhood pooling is applied identically when
+        # fitting the bank and when scoring against it -- if it were applied to
+        # only one, queries and bank vectors would live in different spaces.
+        if self.local_enabled:
+            local = fused if self.local_source == "fused" else torch.cat(layer_patches, dim=-1)
+            out["local_features"] = self.neighborhood(local)
         return out
 
     # ──────────────────────────────────────────────────────────────────────
     # Score composition
     # ──────────────────────────────────────────────────────────────────────
     def _update_stream_scales(self, mahal: torch.Tensor, freq: torch.Tensor) -> None:
+        """EMA the per-stream magnitudes so beta/gamma/w_local mean what they say.
+
+        The local stream is absent here on purpose: the memory bank does not
+        exist during training, so its scale is fitted in one shot by
+        `fit_normal_model` instead of averaged over batches.
+        """
         m = self.stream_scale_momentum
         with torch.no_grad():
             d = mahal.detach().abs().mean().clamp_min(1e-8)
@@ -224,9 +275,17 @@ class SPADE(nn.Module):
                 self.freq_scale.mul_(1 - m).add_(m * f)
 
     def _compose_scores(
-        self, spatial_mahal: torch.Tensor, freq_mahal: torch.Tensor
+        self,
+        spatial_mahal: torch.Tensor,
+        freq_mahal: torch.Tensor,
+        local_knn: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Combine the descriptor and frequency streams into per-patch scores."""
+        """Combine the local, contextual and frequency streams.
+
+        Each stream is divided by ONE GLOBAL constant, never a per-image one --
+        per-image normalization destroys the calibration that image-level AUROC
+        depends on (EVALUATION_FIX.md).
+        """
         if self.normalize_streams:
             spatial = spatial_mahal / self.mahal_scale.clamp_min(1e-8)
             frequency = freq_mahal / self.freq_scale.clamp_min(1e-8)
@@ -237,7 +296,15 @@ class SPADE(nn.Module):
             "contextual_mahalanobis": self.score_beta * spatial,
             "frequency": self.score_gamma * frequency,
         }
-        return components["contextual_mahalanobis"] + components["frequency"], components
+        if local_knn is not None:
+            local = (
+                local_knn / self.local_scale.clamp_min(1e-8)
+                if self.normalize_streams else local_knn
+            )
+            components["local_knn"] = self.score_w_local * local
+
+        total = sum(components.values())
+        return total, components
 
     def _score_perturbed(
         self, descriptors: torch.Tensor, freq_mahal: torch.Tensor, epsilon: float
@@ -339,7 +406,15 @@ class SPADE(nn.Module):
         if self.training and update_stats:
             self._update_stream_scales(spatial_mahal, freq_mahal)
 
-        patch_scores, score_components = self._compose_scores(spatial_mahal, freq_mahal)
+        # ── local pathway: nearest normal patch, no distributional assumption ──
+        local_features = built.get("local_features")
+        local_knn = None
+        if local_features is not None and self.memory_bank.fitted:
+            local_knn = self.memory_bank(local_features)
+
+        patch_scores, score_components = self._compose_scores(
+            spatial_mahal, freq_mahal, local_knn
+        )
 
         _debug_logger.debug(
             f"[SPADE] mahal mean={float(spatial_mahal.detach().mean()):.4f} "
@@ -359,6 +434,8 @@ class SPADE(nn.Module):
         }
         if "patch_query_attention" in built:
             outputs["patch_query_attention"] = built["patch_query_attention"]
+        if local_features is not None:
+            outputs["local_features"] = local_features
         if perturb_epsilon is not None:
             outputs["patch_scores_perturbed"] = self._score_perturbed(
                 descriptors, freq_mahal, perturb_epsilon

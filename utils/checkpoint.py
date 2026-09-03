@@ -18,6 +18,23 @@ import torch
 import torch.nn as nn
 
 
+def _resize_variable_buffers(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Grow or shrink buffers whose size is data-dependent, not architectural."""
+    for name in ("memory_bank.bank",):
+        incoming = state_dict.get(name)
+        if incoming is None:
+            continue
+        module_path, _, attribute = name.rpartition(".")
+        try:
+            module = model.get_submodule(module_path)
+        except AttributeError:
+            continue
+        current = getattr(module, attribute, None)
+        if current is None or tuple(current.shape) == tuple(incoming.shape):
+            continue
+        setattr(module, attribute, incoming.detach().clone().to(current.dtype))
+
+
 def filter_compatible_state(
     state_dict: dict[str, torch.Tensor],
     model: nn.Module,
@@ -32,6 +49,14 @@ def filter_compatible_state(
         (compatible, rejected) where rejected is a list of
         (name, checkpoint_shape, model_shape).
     """
+    # The memory bank is a legitimately variable-size buffer: its length is
+    # coreset_ratio * (patches in THIS category's training set), so it differs
+    # per category and per config. Resize the destination to match before the
+    # shape check, or the bank would be silently rejected as "incompatible" and
+    # the local pathway would load unfitted -- scoring zeros, with the run
+    # looking otherwise healthy.
+    _resize_variable_buffers(model, state_dict)
+
     reference = model.state_dict()
     compatible: dict[str, torch.Tensor] = {}
     rejected: list[tuple[str, tuple, tuple]] = []

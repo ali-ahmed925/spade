@@ -173,6 +173,12 @@ def evaluate(
     all_masks: list[np.ndarray] = []
     all_heatmaps: list[np.ndarray] = []
     all_image_info: list[dict] = []  # Store image paths and scores for detailed output
+    # Per-stream scores, so local-only vs contextual-only is readable from one
+    # run rather than requiring a weight sweep. Stream names are read from the
+    # model, never hardcoded -- the previous per-stream diagnostic silently
+    # reported nothing once a redesign renamed them.
+    stream_scores: dict[str, list[float]] = {}
+    stream_maps: dict[str, list[np.ndarray]] = {}
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="Evaluating")):
         images = batch["image"].to(device)
@@ -184,8 +190,20 @@ def evaluate(
         patch_scores = outputs["patch_scores"]  # Changed from patch_logits
 
         image_scores = model.get_image_score(patch_scores)
+        components = outputs.get("score_components", {})
 
         for i in range(images.size(0)):
+            for name, tensor in components.items():
+                stream_scores.setdefault(name, []).append(
+                    float(model.get_image_score(tensor[i : i + 1]).cpu())
+                )
+                stream_maps.setdefault(name, []).append(
+                    patches_to_heatmap(
+                        tensor[i].detach().cpu(), image_size=image_size,
+                        patch_size=patch_size, normalize=False, smooth_sigma=smooth_sigma,
+                    )
+                )
+
             image_score = float(image_scores[i].cpu())
             label = int(labels[i])
             image_path = paths[i] if isinstance(paths, (list, tuple)) else paths
@@ -329,7 +347,35 @@ def evaluate(
     else:
         results["pixel_auroc"] = float("nan")
         results["pro"] = float("nan")
-    
+
+    # ── Per-stream breakdown ──
+    # Each additive stream scored ON ITS OWN. This is the ablation: whether the
+    # local kNN pathway or the contextual Mahalanobis one carries the result is
+    # readable here directly, with no weight tuning and no second run.
+    results["streams"] = {}
+    if stream_scores:
+        print("\n" + "=" * 72)
+        print("PER-STREAM BREAKDOWN (each stream scored alone)")
+        print("=" * 72)
+        print(f"{'stream':<28}{'image AUROC':>14}{'pixel AUROC':>14}{'PRO':>10}")
+        print("-" * 72)
+        for name, values in stream_scores.items():
+            entry = {"image_auroc": compute_image_auroc(labels_arr, np.array(values))}
+            if masks_arr.max() > 0:
+                maps = np.stack(stream_maps[name])
+                entry["pixel_auroc"] = compute_pixel_auroc(masks_arr, maps)
+                try:
+                    entry["pro"] = compute_pro(masks_arr, maps)
+                except Exception:  # noqa: BLE001 - secondary metric
+                    entry["pro"] = float("nan")
+            results["streams"][name] = entry
+            print(f"{name:<28}{entry['image_auroc']:>14.4f}"
+                  f"{entry.get('pixel_auroc', float('nan')):>14.4f}"
+                  f"{entry.get('pro', float('nan')):>10.4f}")
+        print(f"{'TOTAL (weighted sum)':<28}{results['image_auroc']:>14.4f}"
+              f"{results['pixel_auroc']:>14.4f}{results['pro']:>10.4f}")
+        print("=" * 72)
+
     # ── Print detailed image scores ──
     print("\n" + "=" * 80)
     print("IMAGE-LEVEL ANOMALY SCORES")

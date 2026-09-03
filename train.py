@@ -27,6 +27,8 @@ from utils.logging import get_logger, run_log_path
 from utils.seed import set_seed
 from utils.early_stopping import EarlyStopping
 from utils.selection import should_save_checkpoint
+from models.normal_fit import fit_normal_model
+from utils.checkpoint import load_checkpoint_into
 
 
 def load_config() -> dict:
@@ -311,6 +313,20 @@ def main() -> None:
         patch_size=cfg["vit"]["patch_size"],
         synthetic_method=synthetic_method,  # None = no synthetic anomalies
         synthetic_prob=synthetic_prob,  # 0.0 = no synthetic anomalies
+        synthetic_cfg=cfg.get("synthetic", {}),
+    )
+
+    # A clean view of train/good for the end-of-training normal-model fit: no
+    # synthetic anomalies, no shuffling, so the fit sees exactly the normal
+    # distribution and is reproducible.
+    fit_dataset = MVTecDataset(
+        root=cfg["dataset"]["root"],
+        category=cfg["dataset"]["category"],
+        split="train",
+        image_size=cfg["vit"]["image_size"],
+        patch_size=cfg["vit"]["patch_size"],
+        synthetic_method=None,
+        synthetic_prob=0.0,
         synthetic_cfg=cfg.get("synthetic", {}),
     )
 
@@ -715,6 +731,45 @@ def main() -> None:
             os.path.join(checkpoint_dir, "spade_last.pt"),
             epoch, current_image, current_patch,
         )
+
+    # ── Fit the normal model over the FULL training set ──────────────────
+    # Until here the Mahalanobis statistics came from a 20k rolling deque --
+    # roughly the last 20 images of the last epoch -- EMA'd across overlapping
+    # windows, and the memory bank did not exist at all. Both are fitted once,
+    # in closed form, from every normal patch.
+    #
+    # Done per checkpoint rather than once, because spade_best.pt holds
+    # different weights from the final epoch: a bank fitted for one set of
+    # weights does not describe the other.
+    fit_loader = DataLoader(
+        fit_dataset, batch_size=tcfg["batch_size"], shuffle=False, num_workers=0
+    )
+    fit_cfg = cfg.get("normal_fit", {})
+
+    for name in ("spade_last.pt", "spade_best.pt"):
+        path = os.path.join(checkpoint_dir, name)
+        if not os.path.exists(path):
+            continue
+        logger.info(f"Fitting the normal model for {name} ...")
+
+        payload = torch.load(path, map_location=device, weights_only=False)
+        load_checkpoint_into(
+            model, payload["model_state_dict"], logger=logger, context=name
+        )
+        report = fit_normal_model(
+            model, fit_loader, device,
+            max_patches=int(fit_cfg.get("max_patches", 500_000)),
+            seed=int(tcfg["seed"]),
+            logger=logger,
+        )
+
+        payload["model_state_dict"] = {
+            k: v for k, v in model.state_dict().items()
+            if not k.startswith("vision_encoder.")
+        }
+        payload["normal_fit"] = report
+        torch.save(payload, path)
+        logger.info(f"  {name}: {report}")
 
     if use_wandb:
         wandb.finish()

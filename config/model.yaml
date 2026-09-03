@@ -35,12 +35,49 @@ context:
   n_heads: 8
   dropout: 0.0
 
+# ── LOCAL detection pathway ──
+# The contextualizer overwrites rather than augments: the only representation
+# Mahalanobis ever saw was [local | context], where the context half is
+# attention over 32 IMAGE-LEVEL tokens and is near-constant across patches
+# within an image. That half varies between images but not between patches, so
+# under one pooled Gaussian it inflates Sigma without adding discrimination --
+# and no raw local appearance reached the score without global mixing first.
+#
+# This pathway branches before the contextualizer and is scored against a
+# coreset memory bank, which makes no unimodality assumption at all. The
+# Q-Former pathway is untouched and still contributes its own stream.
+local_pathway:
+  enabled: true
+  source: "fused"            # fused = trainable fusion output (512-d)
+                             # raw   = concatenated tapped ViT layers (2816-d),
+                             #         the untrained PatchCore-style control
+  neighborhood: 3            # k x k average pool on the 32x32 grid; 1 disables
+                             # it and is the ablation control
+
+# ── Coreset memory bank ──
+# PatchCore's normal model: keep the normal patches themselves and score by
+# distance to the nearest one. Greedy k-center subsampling retains the outlying
+# normal modes that random sampling would drop -- exactly what a rare but
+# legitimate normal patch needs to match against.
+memory_bank:
+  coreset_ratio: 0.01        # fraction of training patches kept
+  max_size: 50000            # hard cap on bank size
+  k: 1                       # neighbours averaged; 1 is PatchCore's choice
+  projection_dim: 128        # JL projection used for SELECTION only
+  seed: 0
+  query_chunk: 1024          # queries per distance matrix
+
 # ── Patch Scoring ──
 # Mahalanobis scores the contextual descriptors. The old additive
 # attention-importance and cross terms are gone: the Q-Former now enters through
 # the descriptor itself rather than through a term measured at ~1e-5 of the
 # score magnitude and anti-correlated with anomaly at image level.
 scoring:
+  # Stream weights. Each stream is divided by its own global scale first, so
+  # these are directly comparable. They are PRIORS, not tuned values: eval.py
+  # reports every stream standalone, so local-only vs contextual-only is read
+  # off a single run rather than fitted.
+  w_local: 1.0                            # local kNN weight (memory bank)
   beta: 0.9                               # contextual Mahalanobis weight
   gamma: 0.1                              # frequency Mahalanobis weight
   mahalanobis_gamma: 1.0                  # non-linear amplification factor

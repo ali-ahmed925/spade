@@ -38,6 +38,8 @@ def build_spade(cfg: dict, device: torch.device | str = "cpu", blip2_model=None)
     ctx = cfg.get("context", {})
     scoring = cfg.get("scoring", {})
     stats = cfg.get("normal_stats", {})
+    local = cfg.get("local_pathway", {})
+    bank = dict(cfg.get("memory_bank", {}))
 
     model = SPADE(
         blip2_model_name=cfg["blip2"]["model_name"],
@@ -54,6 +56,11 @@ def build_spade(cfg: dict, device: torch.device | str = "cpu", blip2_model=None)
         mahalanobis_reg=float(scoring.get("mahalanobis_reg", 1e-4)),
         normalize_streams=scoring.get("normalize_streams", True),
         image_aggregation=scoring.get("image_aggregation", "topk_mean"),
+        local_enabled=local.get("enabled", True),
+        local_source=local.get("source", "fused"),
+        local_neighborhood=int(local.get("neighborhood", 3)),
+        score_w_local=float(scoring.get("w_local", 1.0)),
+        memory_bank_cfg=bank,
         normal_stats_buffer_size=stats.get("buffer_size", 20000),
         normal_stats_update_frequency=stats.get("update_frequency", 100),
         projection_trainable=cfg.get("projection", {}).get("trainable", False),

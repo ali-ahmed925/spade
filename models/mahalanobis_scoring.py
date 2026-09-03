@@ -122,3 +122,63 @@ class MahalanobisScoring(nn.Module):
         
         return mahalanobis_scores
 
+
+    @torch.no_grad()
+    def fit_from_normal_patches(self, normal_patches: torch.Tensor) -> dict[str, float]:
+        """Fit mu and Sigma once, in closed form, from the FULL normal set.
+
+        This replaces `update_statistics` for the final fit, and exists because
+        that method does not estimate the covariance of the normal distribution:
+
+            sigma_updated = (1 - m) * inv(sigma_inv) + m * sigma_new
+            sigma_inv     = inv(sigma_updated)
+
+        Every `sigma_new` is a covariance computed around its OWN window mean, so
+        the running average accumulates within-window scatter and systematically
+        misses the spread BETWEEN windows. The result is a smoothed average of
+        local covariances, not the global one -- and it costs two 512x512
+        inversions per update, whose numerical error compounds across training.
+
+        Combined with a `deque(maxlen=20000)` holding roughly the last 20 images,
+        the shipped statistics described a small, recent, arbitrary slice of the
+        training set. This method takes every patch and does one inversion.
+        """
+        if normal_patches.ndim != 2 or normal_patches.shape[1] != self.feature_dim:
+            raise ValueError(
+                f"expected (N, {self.feature_dim}) patches, got {tuple(normal_patches.shape)}"
+            )
+        n_samples = normal_patches.shape[0]
+        if n_samples <= self.feature_dim:
+            raise ValueError(
+                f"{n_samples} samples cannot determine a {self.feature_dim}-d covariance; "
+                "fit from more of the training set"
+            )
+
+        patches = normal_patches.to(torch.float64)
+        mu = patches.mean(dim=0)
+        centered = patches - mu
+        sigma = (centered.T @ centered) / (n_samples - 1)
+
+        reg = float(self.regularization)
+        sigma += reg * torch.eye(self.feature_dim, device=sigma.device, dtype=sigma.dtype)
+
+        # Cholesky is both faster and a genuine positive-definiteness check: if
+        # it fails, the covariance is singular and the score would be nonsense
+        # rather than merely inaccurate.
+        try:
+            cholesky = torch.linalg.cholesky(sigma)
+            sigma_inv = torch.cholesky_inverse(cholesky)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"covariance is not positive definite at regularization={reg}; "
+                f"raise scoring.mahalanobis_reg or fit from more patches ({exc})"
+            ) from exc
+
+        self.mu.data = mu.to(self.mu.dtype)
+        self.sigma_inv.data = sigma_inv.to(self.sigma_inv.dtype)
+        self.is_initialized.data = torch.tensor(True, device=self.mu.device)
+
+        return {
+            "samples": float(n_samples),
+            "condition_number": float(torch.linalg.cond(sigma).item()),
+        }

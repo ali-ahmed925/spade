@@ -37,6 +37,15 @@ training:
     # the checkpoint on the first epoch and discards the rest of training.
     selection_tie_tol: 1.0e-6
 
+# ── Normal-model fit (runs once, after the last epoch) ──
+# Replaces the 20k rolling deque that previously supplied the statistics. Every
+# normal patch in train/good is passed once; the Mahalanobis covariance is fitted
+# in closed form and the coreset memory bank is built from the same pass.
+normal_fit:
+  max_patches: 500000          # cap on patches held in RAM (~1 GB at 512-d);
+                               # beyond it patches are kept by Bernoulli draw,
+                               # never by truncation
+
 # ── Weights & Biases ──
 wandb:
   enabled: true
