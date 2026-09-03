@@ -36,6 +36,16 @@ training:
     # saturated primary (wood hits val image AUROC 1.0000 at epoch 1) freezes
     # the checkpoint on the first epoch and discards the rest of training.
     selection_tie_tol: 1.0e-6
+    # Which detector ranks the epochs. "full" fits the memory bank and the
+    # Mahalanobis statistics before each validation, so selection uses the SAME
+    # detector that gets reported. "contextual" is the old behaviour: rank by the
+    # Mahalanobis stream alone, which is a different detector from the one that
+    # ships and can therefore save the wrong epoch.
+    #
+    # "full" costs one extra forward pass over train/good per epoch plus the
+    # coreset build -- roughly 1.5-2x epoch time. That is the price of the
+    # selected checkpoint actually being the best one.
+    selection_detector: "full"     # full | contextual
 
 # ── Normal-model fit (runs once, after the last epoch) ──
 # Replaces the 20k rolling deque that previously supplied the statistics. Every
@@ -45,6 +55,9 @@ normal_fit:
   max_patches: 500000          # cap on patches held in RAM (~1 GB at 512-d);
                                # beyond it patches are kept by Bernoulli draw,
                                # never by truncation
+  selection_max_patches: 100000  # cheaper fit used for per-epoch selection;
+                                 # selection needs epochs RANKED correctly, not
+                                 # measured exactly, so it runs on a subsample
 
 # ── Weights & Biases ──
 wandb:

@@ -494,6 +494,15 @@ def main() -> None:
             f"use_pseudo={loss_cfg.get('use_pseudo', False)})"
         )
 
+    # A cheaper fit used for per-epoch checkpoint selection. Selection needs the
+    # epochs RANKED correctly, not measured exactly, so it runs on a subsample;
+    # the reported numbers come from the full fit after training.
+    fit_cfg_early = cfg.get("normal_fit", {})
+    selection_fit_patches = int(fit_cfg_early.get("selection_max_patches", 100_000))
+    selection_fit_loader = DataLoader(
+        fit_dataset, batch_size=tcfg["batch_size"], shuffle=False, num_workers=0
+    )
+
     # ── Training loop ──
     # Organize checkpoints by category
     category = cfg["dataset"]["category"]
@@ -544,6 +553,18 @@ def main() -> None:
     selection_metric = ckpt_cfg.get("selection_metric", "image_auroc")
     selection_min_delta = float(ckpt_cfg.get("selection_min_delta", 0.0))
     selection_tie_tol = float(ckpt_cfg.get("selection_tie_tol", 1e-6))
+
+    # Which detector decides "best". The scored model now has a local kNN stream
+    # that does not exist until the normal model is fitted -- and the fit happens
+    # after training. Selecting on the contextual stream alone would rank epochs
+    # by a DIFFERENT detector from the one we report, so the saved checkpoint
+    # need not be the best one for the detector that ships.
+    selection_detector = ckpt_cfg.get("selection_detector", "full")
+    if selection_detector not in ("full", "contextual"):
+        raise ValueError(
+            f"training.checkpoint.selection_detector must be 'full' or "
+            f"'contextual', got {selection_detector!r}"
+        )
     if selection_metric not in ("image_auroc", "patch_auroc"):
         raise ValueError(
             f"training.checkpoint.selection_metric must be 'image_auroc' or "
@@ -597,6 +618,20 @@ def main() -> None:
 
         # ── Validation (real test anomalies or synthetic) ──
         if val_loader is not None:
+            # Fit the normal model BEFORE validating, so validate() scores with
+            # the same detector we report. validate() calls model(images), which
+            # picks up whatever streams are fitted -- so this one call is what
+            # aligns selection with the shipped detector.
+            #
+            # It also fixes the statistics used for the epoch's val numbers: the
+            # EMA-over-a-20k-deque path is replaced by a closed-form fit over the
+            # training set every epoch, not just at the end.
+            if selection_detector == "full":
+                fit_normal_model(
+                    model, selection_fit_loader, device,
+                    max_patches=selection_fit_patches,
+                    seed=int(tcfg["seed"]), logger=None,
+                )
             val_metrics = validate(model, val_loader, device)
             logger.info(
                 f"Val — image_auroc: {val_metrics['val/image_auroc']:.4f} | "
