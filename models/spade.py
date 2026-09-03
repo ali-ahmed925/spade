@@ -39,7 +39,7 @@ addresses the third, in one descriptor, with no per-defect-type logic.
 Trainable: fusion, contextualizer, Q-Former, projection.
 Frozen: ViT-G, LLM.
 Fitted in closed form: Mahalanobis mu/Sigma over descriptors (not learned by
-gradient — accumulated by NormalStatisticsTracker and refitted periodically).
+gradient — accumulated by StreamingGaussianEstimator and refitted every step).
 """
 
 import torch
@@ -47,10 +47,10 @@ import torch.nn as nn
 from transformers import Blip2Model
 
 from models.memory_bank import CoresetMemoryBank
+from models.streaming_stats import StreamingGaussianEstimator, freeze_layernorm_scale
 from models.neighborhood import NeighborhoodAggregator
 from models.feature_fusion import MultiLayerPatchFusion, QueryPatchContextualizer
 from models.mahalanobis_scoring import MahalanobisScoring
-from models.normal_statistics import NormalStatisticsTracker
 from models.projection import LLMProjection
 from models.qformer import Blip2QFormerWrapper
 from models.vit import FrozenVisionEncoder
@@ -89,7 +89,8 @@ class SPADE(nn.Module):
         memory_bank_cfg: dict | None = None,
         # ── normal statistics ──
         normal_stats_buffer_size: int = 20000,
-        normal_stats_update_frequency: int = 100,
+        normal_stats_update_frequency: int = 1,
+        freeze_output_scale: bool = True,
         # ── misc ──
         projection_trainable: bool = False,
         blip2_model=None,
@@ -170,9 +171,13 @@ class SPADE(nn.Module):
             regularization=mahalanobis_reg,
             gamma=mahalanobis_gamma,
         )
-        self.normal_stats_tracker = NormalStatisticsTracker(
+        # Exact streaming sufficient statistics, refit every step by default.
+        # The previous deque(maxlen=20000) + EMA-of-window-covariances held
+        # roughly the last 20 images and lagged the feature space by up to 100
+        # steps, which is the whole reason the shrinkage exploit existed.
+        self.normal_stats = StreamingGaussianEstimator(
             feature_dim=self.descriptor_dim,
-            buffer_size=normal_stats_buffer_size,
+            regularization=mahalanobis_reg,
             update_frequency=normal_stats_update_frequency,
         )
 
@@ -181,6 +186,19 @@ class SPADE(nn.Module):
         self.projection_trainable = projection_trainable
         for p_ in self.projection.parameters():
             p_.requires_grad = bool(projection_trainable)
+
+        # ── remove the scale degree of freedom (P0, part A) ──
+        # A LayerNorm pinned to (weight=1, bias=0) emits vectors with
+        # ||x||_2 == sqrt(D) exactly, so no parameter can globally rescale the
+        # scored descriptor. That kills the unbounded "shrink the features to
+        # beat stale statistics" descent direction structurally, at zero cost.
+        self.output_scale_frozen = False
+        if freeze_output_scale:
+            frozen = [
+                freeze_layernorm_scale(getattr(self.contextualizer, "out_norm", None)),
+                freeze_layernorm_scale(getattr(self.fusion, "out_norm", None)),
+            ]
+            self.output_scale_frozen = any(frozen)
 
         # ── score weights ──
         self.image_aggregation = image_aggregation
@@ -205,7 +223,7 @@ class SPADE(nn.Module):
         self.use_frequency = False
         self.freq_extractor = None
         self.freq_mahalanobis_scorer = None
-        self.freq_normal_stats_tracker = None
+        self.freq_normal_stats = None
 
     # ──────────────────────────────────────────────────────────────────────
     # Descriptor construction
@@ -251,6 +269,24 @@ class SPADE(nn.Module):
             local = fused if self.local_source == "fused" else torch.cat(layer_patches, dim=-1)
             out["local_features"] = self.neighborhood(local)
         return out
+
+    def compute_frequency_features(self, images: torch.Tensor) -> torch.Tensor:
+        """(B, 3, H, W) -> (B, N, freq_dim) Fourier descriptors of the RAW pixels.
+
+        Factored out of `forward` so the full-data fit can refit the frequency
+        statistics too. Previously `fit_normal_model` refit only the contextual
+        Mahalanobis stream, leaving the frequency stream -- gamma=0.1 of every
+        reported score -- on the stale EMA path with statistics from the last
+        ~20 training images.
+        """
+        from utils.patch_extraction import extract_image_patches_from_tensor
+
+        image_patches = extract_image_patches_from_tensor(
+            images, patch_size=self.vision_encoder.patch_size
+        )
+        patches_tensor = torch.from_numpy(image_patches).to(images.device)
+        features = self.freq_extractor(patches_tensor)
+        return features.reshape(images.shape[0], self.num_patches, -1)
 
     # ──────────────────────────────────────────────────────────────────────
     # Score composition
@@ -355,18 +391,14 @@ class SPADE(nn.Module):
         )
 
         # ── normal statistics over descriptors ──
+        # Exact accumulators, refit every step. Anomalous patches are excluded
+        # by the estimator itself, so a synthetic defect can never enter the
+        # normal model.
         if update_stats and patch_labels is not None:
-            self.normal_stats_tracker.add_normal_patches(descriptors, patch_labels)
-            tracker = self.normal_stats_tracker
-            if tracker.step_count % tracker.update_frequency == 0:
-                if len(tracker.normal_patch_buffer) > 0:
-                    normal_descriptors = torch.stack(
-                        list(tracker.normal_patch_buffer)
-                    ).to(descriptors.device)
-                    self.mahalanobis_scorer.update_statistics(normal_descriptors)
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            tracker.step_count += 1
+            self.normal_stats.update(descriptors, patch_labels)
+            if self.normal_stats.should_refit():
+                mu, sigma = self.normal_stats.statistics()
+                self.mahalanobis_scorer.set_statistics(mu, sigma)
 
         # ── frequency stream (parallel, on raw image patches) ──
         freq_mahal = torch.zeros(
@@ -374,29 +406,13 @@ class SPADE(nn.Module):
             device=descriptors.device, dtype=descriptors.dtype,
         )
         if self.use_frequency and self.freq_extractor is not None:
-            from utils.patch_extraction import extract_image_patches_from_tensor
-
-            image_patches = extract_image_patches_from_tensor(
-                images, patch_size=self.vision_encoder.patch_size
-            )
-            patches_tensor = torch.from_numpy(image_patches).to(images.device)
-            freq_features = self.freq_extractor(patches_tensor)
-            freq_features = freq_features.reshape(
-                descriptors.shape[0], self.num_patches, -1
-            )
+            freq_features = self.compute_frequency_features(images)
 
             if update_stats and patch_labels is not None:
-                self.freq_normal_stats_tracker.add_normal_patches(
-                    freq_features, patch_labels
-                )
-                freq_tracker = self.freq_normal_stats_tracker
-                if freq_tracker.step_count % freq_tracker.update_frequency == 0:
-                    if len(freq_tracker.normal_patch_buffer) > 0:
-                        normal_freq = torch.stack(
-                            list(freq_tracker.normal_patch_buffer)
-                        ).to(freq_features.device)
-                        self.freq_mahalanobis_scorer.update_statistics(normal_freq)
-                freq_tracker.step_count += 1
+                self.freq_normal_stats.update(freq_features, patch_labels)
+                if self.freq_normal_stats.should_refit():
+                    mu_f, sigma_f = self.freq_normal_stats.statistics()
+                    self.freq_mahalanobis_scorer.set_statistics(mu_f, sigma_f)
 
             freq_mahal = self.freq_mahalanobis_scorer(freq_features)
 
@@ -483,6 +499,28 @@ class SPADE(nn.Module):
             f"image aggregation must be 'topk_mean' or 'max', got {mode!r}"
         )
 
+    @torch.no_grad()
+    def patchcore_image_score(
+        self,
+        local_features: torch.Tensor,
+        local_scores: torch.Tensor,
+        b: int = 9,
+    ) -> torch.Tensor:
+        """PatchCore's re-weighted image score, on the LOCAL stream only.
+
+        The re-weighting is defined over nearest-neighbour distances to a memory
+        bank, so it is only meaningful for `local_knn`. Applying it to the fused
+        score -- which mixes in a Mahalanobis and a Fourier term -- would not be
+        the published method. eval.py therefore reports it as a third
+        aggregation of the local stream, never of TOTAL.
+        """
+        if not (self.local_enabled and self.memory_bank.fitted):
+            raise RuntimeError(
+                "patchcore aggregation needs the local pathway enabled and a "
+                "fitted memory bank"
+            )
+        return self.memory_bank.patchcore_reweight(local_features, local_scores, b=b)
+
     def enable_frequency_features(
         self,
         freq_num_bands: int = 6,
@@ -514,8 +552,8 @@ class SPADE(nn.Module):
             regularization=self.mahalanobis_scorer.regularization,
             gamma=self.mahalanobis_scorer.gamma,
         )
-        self.freq_normal_stats_tracker = NormalStatisticsTracker(
+        self.freq_normal_stats = StreamingGaussianEstimator(
             feature_dim=freq_dim,
-            buffer_size=self.normal_stats_tracker.buffer_size,
-            update_frequency=self.normal_stats_tracker.update_frequency,
+            regularization=self.mahalanobis_scorer.regularization,
+            update_frequency=self.normal_stats.update_frequency,
         )

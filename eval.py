@@ -192,6 +192,7 @@ def evaluate(
         image_scores = model.get_image_score(patch_scores)
         components = outputs.get("score_components", {})
 
+        local_features = outputs.get("local_features")
         for i in range(images.size(0)):
             for name, tensor in components.items():
                 stream_scores.setdefault(name, []).append(
@@ -202,6 +203,26 @@ def evaluate(
                         tensor[i].detach().cpu(), image_size=image_size,
                         patch_size=patch_size, normalize=False, smooth_sigma=smooth_sigma,
                     )
+                )
+
+            # PatchCore's re-weighted image score, reported as a third
+            # aggregation of the LOCAL stream only: the re-weighting is defined
+            # over kNN distances to a bank, so applying it to a fused score
+            # would not be the published method. The MAP is identical to
+            # local_knn's -- only the image-level reduction differs.
+            if local_features is not None and model.memory_bank.fitted:
+                raw_local = (
+                    outputs["score_components"]["local_knn"]
+                    / max(float(model.score_w_local), 1e-8)
+                    * float(model.local_scale)
+                )
+                stream_scores.setdefault("local_knn[patchcore]", []).append(
+                    float(model.patchcore_image_score(
+                        local_features[i : i + 1], raw_local[i : i + 1]
+                    ).cpu())
+                )
+                stream_maps.setdefault("local_knn[patchcore]", []).append(
+                    stream_maps["local_knn"][-1]
                 )
 
             image_score = float(image_scores[i].cpu())
@@ -609,6 +630,36 @@ def main() -> None:
     logger.info(f"model: {describe(model)}")
     if "config" in ckpt_meta:
         logger.info(f"checkpoint config: {ckpt_meta['config']}")
+    # The detector that SELECTED this checkpoint is recorded inside it. If the
+    # current config scores with different stream weights or a different
+    # aggregation, the reported number comes from a different detector than the
+    # one that chose the epoch -- which is exactly the mismatch P3 exists to
+    # prevent. Report it loudly rather than letting it pass.
+    recorded = ckpt_meta.get("selection_config")
+    if recorded:
+        current = {
+            "local_knn": float(cfg["scoring"].get("w_local", 1.0)),
+            "contextual_mahalanobis": float(cfg["scoring"].get("beta", 0.9)),
+            "frequency": float(cfg["scoring"].get("gamma", 0.1)),
+        }
+        logger.info(f"selected by: {recorded}")
+        if recorded.get("stream_weights") != current:
+            logger.warning(
+                f"STREAM WEIGHT MISMATCH: checkpoint selected with "
+                f"{recorded.get('stream_weights')} but evaluating with {current}. "
+                "The reported detector is not the one that chose this epoch."
+            )
+        if recorded.get("local_source") != cfg.get("local_pathway", {}).get("source", "fused"):
+            logger.warning(
+                f"LOCAL SOURCE MISMATCH: selected with "
+                f"{recorded.get('local_source')!r}, evaluating with "
+                f"{cfg.get('local_pathway', {}).get('source', 'fused')!r}."
+            )
+    else:
+        logger.warning(
+            "this checkpoint records no selection_config; it predates the "
+            "explicit selection protocol and its selecting detector is unknown"
+        )
 
     # ── P1: swap in position-conditioned Mahalanobis ──
     if args.positional:

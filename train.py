@@ -197,8 +197,14 @@ def validate(
     model: SPADE,
     loader: DataLoader,
     device: torch.device,
+    aggregation: str | None = None,
 ) -> dict[str, float]:
-    """Validation on real MVTec test split (image AUROC + patch AUROC)."""
+    """Validation on real MVTec test split (image AUROC + patch AUROC).
+
+    `aggregation` is passed explicitly rather than read from the model, so the
+    reduction used to RANK epochs is a declared part of the selection protocol
+    instead of an implicit consequence of `scoring.image_aggregation`.
+    """
     model.eval()
 
     all_image_labels: list[int] = []
@@ -216,7 +222,9 @@ def validate(
         patch_scores = outputs["patch_scores"]
         normalized_scores = torch.sigmoid(torch.log1p(patch_scores))
         patch_probs = normalized_scores.detach().cpu().numpy().astype(np.float32)  # (B, N)
-        image_scores = model.get_image_score(patch_scores).detach().cpu().numpy().astype(np.float32)  # (B,)
+        image_scores = model.get_image_score(
+            patch_scores, aggregation=aggregation
+        ).detach().cpu().numpy().astype(np.float32)  # (B,)
 
         all_image_labels.extend(labels.tolist())
         all_image_scores.extend(image_scores.tolist())
@@ -531,6 +539,7 @@ def main() -> None:
             "val_image_auroc": float(image_auroc),
             "val_patch_auroc": float(patch_auroc),
             "selection_metric": selection_metric,
+            "selection_config": selection_config,
             "model_state_dict": {
                 k: v for k, v in model.state_dict().items()
                 if not k.startswith("vision_encoder.")
@@ -559,7 +568,31 @@ def main() -> None:
     # after training. Selecting on the contextual stream alone would rank epochs
     # by a DIFFERENT detector from the one we report, so the saved checkpoint
     # need not be the best one for the detector that ships.
-    selection_detector = ckpt_cfg.get("selection_detector", "full")
+    # ── selection protocol, made explicit and recorded (P3) ──
+    # The detector that ranks epochs must be stated, not inferred, and must
+    # travel with the checkpoint so evaluation can detect a mismatch.
+    selection_aggregation = ckpt_cfg.get("selection_aggregation", "max")
+    if selection_aggregation not in ("topk_mean", "max"):
+        raise ValueError(
+            f"selection_aggregation must be 'topk_mean' or 'max', got "
+            f"{selection_aggregation!r}"
+        )
+    selection_config = {
+        "detector": ckpt_cfg.get("selection_detector", "full"),
+        "metric": selection_metric,
+        "aggregation": selection_aggregation,
+        "stream_weights": {
+            "local_knn": float(cfg["scoring"].get("w_local", 1.0)),
+            "contextual_mahalanobis": float(cfg["scoring"].get("beta", 0.9)),
+            "frequency": float(cfg["scoring"].get("gamma", 0.1)),
+        },
+        "fit_max_patches": int(cfg.get("normal_fit", {}).get("selection_max_patches", 100_000)),
+        "final_fit_max_patches": int(cfg.get("normal_fit", {}).get("max_patches", 500_000)),
+        "coreset_ratio": float(cfg.get("memory_bank", {}).get("coreset_ratio", 0.01)),
+        "local_source": cfg.get("local_pathway", {}).get("source", "fused"),
+        "seed": int(tcfg["seed"]),
+    }
+    selection_detector = selection_config["detector"]
     if selection_detector not in ("full", "contextual"):
         raise ValueError(
             f"training.checkpoint.selection_detector must be 'full' or "
@@ -585,6 +618,21 @@ def main() -> None:
         f"ties within {selection_tie_tol:g} broken by the other metric; "
         f"spade_last.pt is always written for fixed-budget comparisons"
     )
+    weights = selection_config["stream_weights"]
+    logger.info(
+        "SELECTION DETECTOR (recorded in every checkpoint):\n"
+        f"    detector      : {selection_config['detector']}\n"
+        f"    aggregation   : {selection_aggregation}\n"
+        f"    stream weights: local={weights['local_knn']} "
+        f"contextual={weights['contextual_mahalanobis']} "
+        f"frequency={weights['frequency']}   <- PRIORS, not tuned\n"
+        f"    local source  : {selection_config['local_source']}\n"
+        f"    fit patches   : {selection_config['fit_max_patches']} for selection, "
+        f"{selection_config['final_fit_max_patches']} for the final fit\n"
+        "    APPROXIMATION: the per-epoch bank is built from the smaller sample, so it is\n"
+        "    correspondingly smaller than the final one. Epoch RANKING is assumed to\n"
+        "    transfer across bank sizes; that assumption is untested."
+    )
 
     early_stop_cfg = tcfg.get("early_stopping", {})
     early_stopper = None
@@ -598,6 +646,14 @@ def main() -> None:
         logger.info(f"Early stopping enabled: patience={early_stopper.patience}, mode={early_stopper.mode}")
 
     for epoch in range(1, tcfg["epochs"] + 1):
+        # The streaming statistics describe the CURRENT feature space. Carrying
+        # them across epochs would mix descriptors produced by different weights
+        # into one covariance -- the same staleness the estimator exists to
+        # remove, just at epoch granularity.
+        model.normal_stats.reset()
+        if getattr(model, "freq_normal_stats", None) is not None:
+            model.freq_normal_stats.reset()
+
         metrics = train_one_epoch(
             model, loader, criterion, optimizer, scheduler, device, epoch, cfg, logger, use_wandb,
         )
@@ -632,7 +688,9 @@ def main() -> None:
                     max_patches=selection_fit_patches,
                     seed=int(tcfg["seed"]), logger=None,
                 )
-            val_metrics = validate(model, val_loader, device)
+            val_metrics = validate(
+                model, val_loader, device, aggregation=selection_aggregation
+            )
             logger.info(
                 f"Val — image_auroc: {val_metrics['val/image_auroc']:.4f} | "
                 f"patch_auroc: {val_metrics['val/patch_auroc']:.4f}"

@@ -33,62 +33,107 @@ def collect_normal_features(
 ) -> dict[str, torch.Tensor]:
     """One pass over train/good, accumulating patch features on CPU.
 
-    Args:
-        max_patches: cap on patches kept per stream. 500k x 512-d float32 is
-            about 1 GB, which is the practical ceiling for holding the set in
-            RAM before fitting. When the dataset exceeds it, patches are kept by
-            an independent Bernoulli draw rather than by truncation -- taking
-            the first N would bias the fit toward whichever images sort first.
+    MEMORY SAFETY (P5). The cap is enforced PER STREAM as an absolute number of
+    rows, not as a byte budget, and the raw local pathway is 2816-d -- 327,680
+    of those is 3.7 GB, well past what the 512-d default was sized for. So the
+    effective cap is derived from `max_patches` scaled by the widest stream's
+    dimension, and the caller no longer has to know to lower it by hand.
+
+    SAMPLING (P2). Patches are kept by an independent Bernoulli draw from a
+    seeded generator, never by truncation, and the draw is shared across streams
+    so the descriptor, local and frequency rows correspond to the SAME patches.
+    Taking the first N would bias the fit toward whichever images sort first.
 
     Returns:
-        {"local": (N, D_local), "descriptors": (N, D_desc)} on CPU, float32.
-        "local" is absent when the local pathway is disabled.
+        {"descriptors": (M, D_desc), "local": (M, D_local), "frequency": (M, D_f)}
+        on CPU, float32. Streams that are disabled are absent.
     """
     was_training = model.training
     model.eval()
 
     n_images = len(loader.dataset)
     total_expected = max(1, n_images * model.num_patches)
-    keep_probability = min(1.0, max_patches / total_expected)
+
+    # Widest stream decides the budget: 500k x 512 floats is ~1 GB, so hold that
+    # constant in BYTES rather than in rows.
+    widest = model.descriptor_dim
+    if getattr(model, "local_enabled", False):
+        widest = max(widest, model.local_dim)
+    effective_cap = collection_cap(max_patches, widest)
+
+    keep_probability = min(1.0, effective_cap / total_expected)
     generator = torch.Generator().manual_seed(seed)
 
-    local_chunks: list[torch.Tensor] = []
-    descriptor_chunks: list[torch.Tensor] = []
+    chunks: dict[str, list[torch.Tensor]] = {}
+
+    def stash(name, tensor):
+        chunks.setdefault(name, []).append(tensor.float().cpu())
 
     for batch in loader:
         images = batch["image"].to(device)
         built = model.build_descriptors(images, return_attention=False)
 
-        descriptors = built["descriptors"].reshape(-1, model.descriptor_dim)
+        streams = {"descriptors": built["descriptors"].reshape(-1, model.descriptor_dim)}
         local = built.get("local_features")
         if local is not None:
-            local = local.reshape(-1, model.local_dim)
+            streams["local"] = local.reshape(-1, model.local_dim)
+        if getattr(model, "use_frequency", False) and model.freq_extractor is not None:
+            freq = model.compute_frequency_features(images)
+            streams["frequency"] = freq.reshape(-1, freq.shape[-1])
 
         if keep_probability < 1.0:
-            mask = torch.rand(descriptors.shape[0], generator=generator) < keep_probability
-            mask = mask.to(descriptors.device)
-            descriptors = descriptors[mask]
-            if local is not None:
-                local = local[mask]
+            rows = next(iter(streams.values())).shape[0]
+            mask = (torch.rand(rows, generator=generator) < keep_probability).to(device)
+            streams = {k: v[mask] for k, v in streams.items()}
 
-        descriptor_chunks.append(descriptors.float().cpu())
-        if local is not None:
-            local_chunks.append(local.float().cpu())
+        for name, tensor in streams.items():
+            stash(name, tensor)
 
     if was_training:
         model.train()
 
-    out = {"descriptors": torch.cat(descriptor_chunks, dim=0)}
-    if local_chunks:
-        out["local"] = torch.cat(local_chunks, dim=0)
+    out = {name: torch.cat(parts, dim=0) for name, parts in chunks.items()}
 
     if logger is not None:
         kept = out["descriptors"].shape[0]
+        gib = sum(t.numel() * 4 for t in out.values()) / 2**30
         logger.info(
             f"normal fit: {n_images} images, {total_expected} patches available, "
-            f"{kept} kept (p={keep_probability:.3f})"
+            f"{kept} kept (p={keep_probability:.3f}, cap={effective_cap}, "
+            f"widest stream {widest}-d, {gib:.2f} GiB held)"
         )
     return out
+
+
+def collection_cap(max_patches: int, widest_dim: int, reference_dim: int = 512) -> int:
+    """Rows to keep, so the byte budget is constant across feature widths.
+
+    `max_patches` was sized for a 512-d stream (500k x 512 float32 ~ 1 GB). The
+    raw local pathway is 2816-d, so the same row count is 5.5x the memory --
+    3.7 GB for screw, which is how the raw path was left needing a manual
+    `max_patches` reduction the caller had to know about. Holding BYTES constant
+    instead makes both widths safe with one setting.
+    """
+    if widest_dim <= 0:
+        return max_patches
+    return max(1, min(max_patches, int(max_patches * reference_dim / widest_dim)))
+
+
+def _subsample(features: torch.Tensor, n: int, seed: int) -> torch.Tensor:
+    """A deterministic RANDOM subset of rows, never a contiguous prefix.
+
+    `features[:n]` looks like a sample but is not one: when the dataset is under
+    the collection cap no Bernoulli draw happens, so the rows are in dataset
+    order and a prefix is simply the first n/1024 images. That is exactly the
+    non-random slicing the full-data fit exists to eliminate, and it had crept
+    back into the calibration and diagnostic steps.
+    """
+    total = features.shape[0]
+    if total <= n:
+        return features
+    generator = torch.Generator().manual_seed(seed)
+    index = torch.randperm(total, generator=generator)[:n]
+    return features[index]
 
 
 @torch.no_grad()
@@ -177,12 +222,32 @@ def fit_normal_model(
                 f"patches kept, mean kNN distance {report['local_scale']:.4f}"
             )
 
+    # ── frequency stream: the same closed-form treatment (P1) ──
+    # This was previously left entirely on the training-time EMA path, so a
+    # shipped checkpoint carried frequency statistics fitted from the last ~20
+    # images while contributing gamma=0.1 of every reported score.
+    if "frequency" in features and getattr(model, "freq_mahalanobis_scorer", None) is not None:
+        freq = features["frequency"].to(device)
+        freq_stats = model.freq_mahalanobis_scorer.fit_from_normal_patches(freq)
+        report["frequency_samples"] = freq_stats["samples"]
+        report["frequency_condition"] = freq_stats["condition_number"]
+        freq_scores = model.freq_mahalanobis_scorer(
+            _subsample(features["frequency"], 50_000, seed + 4).to(device).unsqueeze(0)
+        ).squeeze(0)
+        model.freq_scale.fill_(float(freq_scores.mean().clamp_min(1e-8)))
+        report["freq_scale"] = float(model.freq_scale)
+        if logger is not None:
+            logger.info(
+                f"frequency refit from {int(freq_stats['samples'])} patches "
+                f"(condition {freq_stats['condition_number']:.3g}), "
+                f"scale {report['freq_scale']:.4f}"
+            )
+
     # The contextual scale is EMA'd during training and may be stale or unset if
     # training was short. Recompute it here from the same full pass, so both
     # streams are calibrated against the same data.
     contextual = model.mahalanobis_scorer(
-        features["descriptors"][: min(50_000, features["descriptors"].shape[0])]
-        .to(device).unsqueeze(0)
+        _subsample(features["descriptors"], 50_000, seed + 1).to(device).unsqueeze(0)
     ).squeeze(0)
     model.mahal_scale.fill_(float(contextual.mean().clamp_min(1e-8)))
     model.stream_scales_initialized.fill_(True)
@@ -192,13 +257,13 @@ def fit_normal_model(
     # Whether trained fusion is better or worse than raw ViT features for kNN is
     # an empirical question these numbers answer directly, rather than one to
     # argue about from the shape of the loss.
-    sample = features["descriptors"][: min(20_000, features["descriptors"].shape[0])]
+    sample = _subsample(features["descriptors"], 20_000, seed + 2)
     context_geometry = feature_geometry(sample)
     report["descriptor_norm"] = context_geometry["norm"]
     report["descriptor_effective_rank"] = context_geometry["effective_rank"]
 
     if "local" in features and model.local_enabled:
-        local_sample = features["local"][: min(20_000, features["local"].shape[0])]
+        local_sample = _subsample(features["local"], 20_000, seed + 3)
         local_geometry = feature_geometry(local_sample)
         report["local_norm"] = local_geometry["norm"]
         report["local_effective_rank"] = local_geometry["effective_rank"]

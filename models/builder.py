@@ -62,7 +62,8 @@ def build_spade(cfg: dict, device: torch.device | str = "cpu", blip2_model=None)
         score_w_local=float(scoring.get("w_local", 1.0)),
         memory_bank_cfg=bank,
         normal_stats_buffer_size=stats.get("buffer_size", 20000),
-        normal_stats_update_frequency=stats.get("update_frequency", 100),
+        normal_stats_update_frequency=stats.get("update_frequency", 1),
+        freeze_output_scale=stats.get("freeze_output_scale", True),
         projection_trainable=cfg.get("projection", {}).get("trainable", False),
         blip2_model=blip2_model,
     )

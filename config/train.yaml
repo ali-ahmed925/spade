@@ -46,6 +46,12 @@ training:
     # coreset build -- roughly 1.5-2x epoch time. That is the price of the
     # selected checkpoint actually being the best one.
     selection_detector: "full"     # full | contextual
+    # Reduction used to RANK epochs, declared separately from
+    # scoring.image_aggregation so selection and reporting cannot silently
+    # diverge. "max" is what PaDiM/PatchCore use and is the more sensitive
+    # choice for the small defects screw is failing on; the top-12 mean averages
+    # a ~3-patch defect with 9 normal patches.
+    selection_aggregation: "max"   # topk_mean | max
 
 # ── Normal-model fit (runs once, after the last epoch) ──
 # Replaces the 20k rolling deque that previously supplied the statistics. Every

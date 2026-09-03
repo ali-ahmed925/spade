@@ -124,6 +124,27 @@ class MahalanobisScoring(nn.Module):
 
 
     @torch.no_grad()
+    def set_statistics(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
+        """Install (mu, Sigma) computed elsewhere, inverting Sigma exactly once.
+
+        Used by the streaming estimator during training. `update_statistics`
+        below is the legacy EMA path -- it inverts `sigma_inv` and re-inverts
+        the blend on every call, so its error compounds and its result is an
+        average of window-covariances rather than a covariance.
+        """
+        sigma64 = sigma.to(torch.float64)
+        try:
+            cholesky = torch.linalg.cholesky(sigma64)
+            sigma_inv = torch.cholesky_inverse(cholesky)
+        except RuntimeError:
+            # Singular under the current regularisation: keep the previous
+            # statistics rather than installing a scorer that returns garbage.
+            return
+        self.mu.data = mu.to(self.mu.dtype)
+        self.sigma_inv.data = sigma_inv.to(self.sigma_inv.dtype)
+        self.is_initialized.data = torch.tensor(True, device=self.mu.device)
+
+    @torch.no_grad()
     def fit_from_normal_patches(self, normal_patches: torch.Tensor) -> dict[str, float]:
         """Fit mu and Sigma once, in closed form, from the FULL normal set.
 

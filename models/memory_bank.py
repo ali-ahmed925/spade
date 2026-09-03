@@ -206,6 +206,80 @@ class CoresetMemoryBank(nn.Module):
 
         return torch.cat(scores, dim=0).view(b, n)
 
+    @torch.no_grad()
+    def patchcore_reweight(
+        self,
+        queries: torch.Tensor,
+        patch_scores: torch.Tensor,
+        b: int = 9,
+    ) -> torch.Tensor:
+        """PatchCore's image-level score: the max patch distance, re-weighted.
+
+        From "Towards Total Recall in Industrial Anomaly Detection" (Roth et al.,
+        CVPR 2022), the image score is not simply the maximum patch distance.
+        With
+
+            m_test_star = the test patch with the largest NN distance
+            m_star      = its nearest neighbour in the memory bank
+            s_star      = ||m_test_star - m_star||
+            N_b(m_star) = the b nearest bank patches TO m_star
+
+        the reported score is
+
+            s = ( 1 - exp(s_star) / sum_{m in N_b(m_star)} exp(||m_test_star - m||) ) * s_star
+
+        The intent is to discount a large distance when m_star is itself an
+        isolated, rarely-matched nominal patch: if the test patch is far from
+        everything in that neighbourhood the denominator is large, w approaches
+        1, and the score stands. Because m_star is its own nearest neighbour it
+        belongs to N_b(m_star), so the denominator always contains the numerator
+        and w lies in [0, 1).
+
+        KNOWN DISCREPANCY, deliberately not followed here: anomalib's
+        implementation takes the b nearest neighbours of the TEST patch rather
+        than of m_star (openvinotoolkit/anomalib issue #286). Reported there as
+        making no measurable AUROC difference on their data. This implements the
+        PAPER, since that is the published method being compared against.
+
+        The value of b used in the paper's experiments could NOT be verified
+        from an authoritative source; 9 is the common implementation default and
+        is exposed as a parameter rather than baked in.
+
+        Args:
+            queries: (B, N, D) patch descriptors.
+            patch_scores: (B, N) their nearest-neighbour distances.
+
+        Returns:
+            (B,) re-weighted image scores.
+        """
+        if not self.fitted:
+            return patch_scores.max(dim=1).values
+
+        bank = self.bank.to(queries.dtype)
+        b_eff = min(b, bank.shape[0])
+        out = []
+        for i in range(queries.shape[0]):
+            star_idx = int(torch.argmax(patch_scores[i]))
+            m_test_star = queries[i, star_idx]                       # (D,)
+            s_star = patch_scores[i, star_idx]
+
+            # m_star: nearest bank vector to the max-distance test patch
+            to_bank = torch.cdist(m_test_star[None], bank)[0]         # (M,)
+            m_star = bank[int(torch.argmin(to_bank))]                 # (D,)
+
+            # N_b(m_star): b nearest bank vectors TO m_star (paper, not anomalib)
+            around_star = torch.cdist(m_star[None], bank)[0]          # (M,)
+            neighbour_idx = torch.topk(around_star, b_eff, largest=False).indices
+            neighbours = bank[neighbour_idx]                          # (b, D)
+
+            # distances from the TEST patch to that neighbourhood
+            d = torch.cdist(m_test_star[None], neighbours)[0]         # (b,)
+
+            # softmax written stably: exp(s*)/sum exp(d) == 1/sum exp(d - s*)
+            w = 1.0 - 1.0 / torch.exp(d - s_star).sum().clamp_min(1e-12)
+            out.append(w.clamp(0.0, 1.0) * s_star)
+        return torch.stack(out)
+
     def extra_repr(self) -> str:
         state = f"{self.bank.shape[0]} vectors" if self.fitted else "unfitted"
         return (

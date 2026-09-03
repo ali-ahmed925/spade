@@ -191,9 +191,10 @@ def test_pseudo_loss_also_excludes_anomalous_patches():
 
 def test_statistics_still_exclude_anomalous_patches(model, images, labels):
     """Normal-only Mahalanobis statistics must not absorb synthetic defects."""
-    tracker = model.normal_stats_tracker
-    tracker.normal_patch_buffer.clear()
+    stats = model.normal_stats
+    stats.reset()
     descriptors = torch.randn(BATCH, N_PATCHES, model.descriptor_dim)
-    tracker.add_normal_patches(descriptors, labels)
+    accumulated = stats.update(descriptors, labels)
     expected = int((labels == 0).sum())
-    assert len(tracker.normal_patch_buffer) == expected
+    assert accumulated == expected
+    assert int(stats.count) == expected
