@@ -66,13 +66,24 @@ normal_fit:
                                  # measured exactly, so it runs on a subsample
 
 # ── Weights & Biases ──
+# ── Weights & Biases ──
+# Telemetry only. Every metric is written to logs/runs/<category>/train_*.jsonl
+# FIRST and unconditionally; wandb is a mirror. If the quota runs out mid-run,
+# or wandb is off entirely, the record is still complete and can be pushed up
+# afterwards -- from a different account if needed:
+#
+#   python -c "from utils.run_logger import replay_to_wandb; \
+#              replay_to_wandb('logs/runs/screw/train_XXX.jsonl', project='spade')"
+#
+# WANDB_MODE=offline also works: it records locally and `wandb sync` uploads later.
 wandb:
   enabled: true
   project: "spade-anomaly-detection"
   entity: null                            # your wandb username/team (or null)
-  name: null                               # run name (auto-generated if null)
+  name: null                              # run name (auto-generated if null)
   tags: []
   notes: null
+  # Step-level record frequency is training.log_interval, not a separate knob.
 
 # ── Loss Weights ──
 loss:

@@ -8,6 +8,7 @@ Usage:
 """
 
 import os
+import time
 
 import torch
 import yaml
@@ -24,6 +25,7 @@ from optim.optimizer import build_optimizer
 from optim.scheduler import build_scheduler
 from optim.regularizer import clip_gradients
 from utils.logging import get_logger, run_log_path
+from utils.run_logger import RunLogger
 from utils.seed import set_seed
 from utils.early_stopping import EarlyStopping
 from utils.selection import should_save_checkpoint
@@ -51,7 +53,7 @@ def train_one_epoch(
     epoch: int,
     cfg: dict,
     logger,
-    use_wandb: bool = False,
+    run_log=None,
 ) -> dict[str, float]:
     """Run one training epoch."""
     model.train()
@@ -166,8 +168,8 @@ def train_one_epoch(
                 gnorm=f"{grad_norm:.2f}",
             )
 
-            # Log to wandb at step level
-            if use_wandb:
+            # Step-level record. Goes to disk unconditionally; wandb mirrors it.
+            if run_log is not None:
                 log_dict = {
                     "train/loss_total": running["total"] / num_batches,
                     "train/loss_patch": running["patch"] / num_batches,
@@ -184,7 +186,9 @@ def train_one_epoch(
                 if "grounding" in running:
                     log_dict["train/loss_grounding"] = running["grounding"] / num_batches
                     log_dict.update({f"train/{k}": v for k, v in last_grounding_diagnostics.items()})
-                wandb.log(log_dict, step=current_step)
+                if torch.cuda.is_available():
+                    log_dict["sys/gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 2**30
+                run_log.log(log_dict, step=current_step, event="step")
 
     summary = {k: v / max(num_batches, 1) for k, v in running.items()}
     if criterion.grounding_loss_fn is not None:
@@ -199,11 +203,16 @@ def validate(
     device: torch.device,
     aggregation: str | None = None,
 ) -> dict[str, float]:
-    """Validation on real MVTec test split (image AUROC + patch AUROC).
+    """Validation on the real MVTec test half used for checkpoint selection.
 
     `aggregation` is passed explicitly rather than read from the model, so the
     reduction used to RANK epochs is a declared part of the selection protocol
     instead of an implicit consequence of `scoring.image_aggregation`.
+
+    Reports the fused detector AND every stream on its own, plus how far apart
+    normal and anomalous images score. The per-stream numbers are what make a
+    bad epoch diagnosable: a falling TOTAL beside a healthy local_knn means the
+    fusion weights are wrong, not the representation.
     """
     model.eval()
 
@@ -211,37 +220,63 @@ def validate(
     all_image_scores: list[float] = []
     all_patch_labels: list[np.ndarray] = []
     all_patch_scores: list[np.ndarray] = []
+    stream_scores: dict[str, list[float]] = {}
 
     for batch in tqdm(loader, desc="Validating", leave=False):
         images = batch["image"].to(device)
-        labels = batch["label"].cpu().numpy().astype(np.int64)  # (B,)
-        patch_labels = batch["patch_labels"].cpu().numpy().astype(np.float32)  # (B, N)
+        labels = batch["label"].cpu().numpy().astype(np.int64)
+        patch_labels = batch["patch_labels"].cpu().numpy().astype(np.float32)
 
-        outputs = model(images)  # No update_stats in validation
-        # Normalize patch_scores for evaluation
+        outputs = model(images)
         patch_scores = outputs["patch_scores"]
-        normalized_scores = torch.sigmoid(torch.log1p(patch_scores))
-        patch_probs = normalized_scores.detach().cpu().numpy().astype(np.float32)  # (B, N)
+        patch_probs = torch.sigmoid(torch.log1p(patch_scores)).detach().cpu().numpy().astype(np.float32)
         image_scores = model.get_image_score(
             patch_scores, aggregation=aggregation
-        ).detach().cpu().numpy().astype(np.float32)  # (B,)
+        ).detach().cpu().numpy().astype(np.float32)
+
+        for name, tensor in outputs.get("score_components", {}).items():
+            per_image = model.get_image_score(tensor, aggregation=aggregation)
+            stream_scores.setdefault(name, []).extend(
+                per_image.detach().cpu().numpy().astype(np.float32).tolist()
+            )
 
         all_image_labels.extend(labels.tolist())
         all_image_scores.extend(image_scores.tolist())
         all_patch_labels.append(patch_labels.reshape(-1))
         all_patch_scores.append(patch_probs.reshape(-1))
 
-    from sklearn.metrics import roc_auc_score
+    labels_arr = np.array(all_image_labels)
+    scores_arr = np.array(all_image_scores)
+    patch_labels_arr = np.concatenate(all_patch_labels) if all_patch_labels else np.array([])
+    patch_scores_arr = np.concatenate(all_patch_scores) if all_patch_scores else np.array([])
 
-    y_img = np.array(all_image_labels)
-    s_img = np.array(all_image_scores)
-    y_patch = np.concatenate(all_patch_labels, axis=0)
-    s_patch = np.concatenate(all_patch_scores, axis=0)
+    has_patch_defects = patch_labels_arr.size > 0 and (patch_labels_arr > 0).any()
+    metrics = {
+        "val/image_auroc": compute_image_auroc(labels_arr, scores_arr),
+        "val/patch_auroc": (
+            compute_image_auroc((patch_labels_arr > 0).astype(np.int64), patch_scores_arr)
+            if has_patch_defects else float("nan")
+        ),
+    }
 
-    # AUROC requires both classes present
-    metrics: dict[str, float] = {}
-    metrics["val/image_auroc"] = float(roc_auc_score(y_img, s_img)) if len(np.unique(y_img)) > 1 else float("nan")
-    metrics["val/patch_auroc"] = float(roc_auc_score(y_patch, s_patch)) if len(np.unique(y_patch)) > 1 else float("nan")
+    # Per-stream AUROC: which part of the detector is carrying the result.
+    for name, values in stream_scores.items():
+        metrics[f"val/stream_{name}"] = compute_image_auroc(labels_arr, np.array(values))
+
+    # Separability, the quantity every earlier failure analysis turned on:
+    # normal images score X, anomalous score Y, the ratio is defect elevation,
+    # and the fraction of anomalous images below the normal p99 is how many are
+    # drowned by ordinary variation.
+    normal = scores_arr[labels_arr == 0]
+    anomalous = scores_arr[labels_arr == 1]
+    if normal.size and anomalous.size:
+        metrics["val/score_normal_mean"] = float(normal.mean())
+        metrics["val/score_anomalous_mean"] = float(anomalous.mean())
+        metrics["val/defect_elevation"] = float(anomalous.mean() / max(abs(normal.mean()), 1e-8))
+        metrics["val/drowned_fraction"] = float((anomalous < np.percentile(normal, 99)).mean())
+
+    metrics["_scores"] = scores_arr
+    metrics["_labels"] = labels_arr
     return metrics
 
 
@@ -281,17 +316,42 @@ def main() -> None:
                     "loss": cfg.get("loss", {}),
                 },
             )
-            logger.info("Initialized Weights & Biases logging")
+            logger.info(
+                f"Weights & Biases: {wandb.run.url if wandb.run else 'initialised'}"
+            )
         except Exception as exc:  # noqa: BLE001
             # Telemetry must never abort a training run. A missing API key used
             # to raise UsageError out of main() and kill the job before the
             # first batch.
             logger.warning(
                 f"wandb disabled ({type(exc).__name__}: {exc}). "
-                "Run `wandb login`, set WANDB_API_KEY, use WANDB_MODE=offline, "
-                "or set wandb.enabled=false to silence this."
+                "Run `wandb login --relogin`, set WANDB_API_KEY, use "
+                "WANDB_MODE=offline, or set wandb.enabled=false to silence this. "
+                "Training continues and the full JSONL run record is unaffected; "
+                "utils/run_logger.replay_to_wandb can push it up afterwards."
             )
             use_wandb = False
+
+    # ── Structured run record ──
+    # Disk is primary: a wandb quota failure at epoch 12 must not cost epochs
+    # 1-20. Every metric below lands in JSONL first and is mirrored to wandb
+    # inside a try/except that cannot raise into the training loop.
+    run_log = RunLogger(
+        run_dir=os.path.join("logs", "runs", cfg["dataset"]["category"]),
+        wandb_run=wandb if use_wandb else None,
+        logger=logger,
+        name=f"train_{time.strftime('%Y%m%d-%H%M%S')}",
+    )
+    run_log.log_config({
+        "category": cfg["dataset"]["category"],
+        "vit": cfg.get("vit", {}), "context": cfg.get("context", {}),
+        "scoring": cfg.get("scoring", {}), "local_pathway": cfg.get("local_pathway", {}),
+        "memory_bank": cfg.get("memory_bank", {}), "normal_stats": cfg.get("normal_stats", {}),
+        "normal_fit": cfg.get("normal_fit", {}), "loss": cfg.get("loss", {}),
+        "training": tcfg, "synthetic": cfg.get("synthetic", {}),
+        "frequency": cfg.get("frequency", {}), "projection": cfg.get("projection", {}),
+        "device": str(device),
+    })
 
     # ── Train/Val split from train/good (normal-only) ──
     # Unsupervised training: only normal samples, no synthetic anomalies
@@ -453,8 +513,8 @@ def main() -> None:
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"Trainable params: {trainable:,} / {total:,}")
 
-    if use_wandb:
-        wandb.config.update({
+    if run_log is not None:
+        run_log.log_config({
             "model/trainable_params": trainable,
             "model/total_params": total,
             "model/trainable_ratio": trainable / total,
@@ -645,6 +705,7 @@ def main() -> None:
         )
         logger.info(f"Early stopping enabled: patience={early_stopper.patience}, mode={early_stopper.mode}")
 
+    last_fit_report: dict[str, float] = {}
     for epoch in range(1, tcfg["epochs"] + 1):
         # The streaming statistics describe the CURRENT feature space. Carrying
         # them across epochs would mix descriptors produced by different weights
@@ -655,7 +716,7 @@ def main() -> None:
             model.freq_normal_stats.reset()
 
         metrics = train_one_epoch(
-            model, loader, criterion, optimizer, scheduler, device, epoch, cfg, logger, use_wandb,
+            model, loader, criterion, optimizer, scheduler, device, epoch, cfg, logger, run_log,
         )
         epoch_line = (
             f"Epoch {epoch}/{tcfg['epochs']} — "
@@ -683,10 +744,17 @@ def main() -> None:
             # EMA-over-a-20k-deque path is replaced by a closed-form fit over the
             # training set every epoch, not just at the end.
             if selection_detector == "full":
-                fit_normal_model(
+                last_fit_report = fit_normal_model(
                     model, selection_fit_loader, device,
                     max_patches=selection_fit_patches,
                     seed=int(tcfg["seed"]), logger=None,
+                )
+                logger.info(
+                    f"  geometry: local norm {last_fit_report.get('local_norm', float('nan')):.3f}, "
+                    f"eff.rank {last_fit_report.get('local_effective_rank', float('nan')):.1f}"
+                    f"/{model.local_dim}, "
+                    f"fusion gain {last_fit_report.get('fusion_gain', float('nan')):.4f}, "
+                    f"bank {int(last_fit_report.get('bank_size', 0))}"
                 )
             val_metrics = validate(
                 model, val_loader, device, aggregation=selection_aggregation
@@ -698,19 +766,37 @@ def main() -> None:
         else:
             val_metrics = {"val/image_auroc": float("nan"), "val/patch_auroc": float("nan")}
 
-        # Log epoch-level metrics to wandb
-        if use_wandb:
-            log_dict = {
-                "epoch/loss_total": metrics["total"],
-                "epoch/loss_patch": metrics["patch"],
-                "epoch/epoch": epoch,
-                "val/image_auroc": val_metrics["val/image_auroc"],
-                "val/patch_auroc": val_metrics["val/patch_auroc"],
-            }
-            # Add pseudo loss if available
-            if "pseudo" in metrics:
-                log_dict["epoch/loss_pseudo"] = metrics["pseudo"]
-            wandb.log(log_dict, step=epoch * len(loader))
+        # ── epoch record: losses, every validation metric, the normal-model
+        # fit report, and the score distributions ──
+        epoch_step = epoch * len(loader)
+        log_dict = {f"epoch/loss_{k}": v for k, v in metrics.items()
+                    if isinstance(v, (int, float))}
+        log_dict["epoch/epoch"] = epoch
+        log_dict.update({
+            k: v for k, v in val_metrics.items()
+            if not k.startswith("_") and isinstance(v, (int, float))
+        })
+        log_dict.update({f"fit/{k}": v for k, v in last_fit_report.items()})
+        run_log.log(log_dict, step=epoch_step, event="epoch")
+
+        # Score distributions: normal vs anomalous, separately, so a collapse in
+        # separability is visible before it shows up in AUROC.
+        scores = val_metrics.get("_scores")
+        labels_v = val_metrics.get("_labels")
+        if scores is not None and labels_v is not None and len(scores):
+            run_log.log_histogram("dist/image_scores_normal", scores[labels_v == 0], epoch_step)
+            if (labels_v == 1).any():
+                run_log.log_histogram("dist/image_scores_anomalous", scores[labels_v == 1], epoch_step)
+
+        logger.info(
+            "  val streams: "
+            + "  ".join(
+                f"{k.replace('val/stream_', '')}={v:.4f}"
+                for k, v in sorted(val_metrics.items()) if k.startswith("val/stream_")
+            )
+            + (f"   elevation={val_metrics['val/defect_elevation']:.2f}x"
+               if "val/defect_elevation" in val_metrics else "")
+        )
 
         # ── Early Stopping Check ──
         # Use combined metric (average of image and patch AUROC) for early stopping
@@ -732,8 +818,10 @@ def main() -> None:
                         f"(combined score: {current_score:.4f} = "
                         f"image:{current_image:.4f} + patch:{current_patch:.4f} / 2)"
                     )
-                    if use_wandb:
-                        wandb.log({"early_stopping/triggered": True, "early_stopping/epoch": epoch})
+                    run_log.log(
+                        {"early_stopping/triggered": 1, "early_stopping/epoch": epoch},
+                        event="early_stopping",
+                    )
                     break
 
         # ── Checkpoint Saving Logic ──
@@ -802,10 +890,14 @@ def main() -> None:
                         f"image_auroc={best_val_image_auroc:.4f}, "
                         f"patch_auroc={best_val_patch_auroc:.4f} → saved {best_path}"
                     )
-                    if use_wandb:
-                        wandb.run.summary["best_val_image_auroc"] = float(best_val_image_auroc)
-                        wandb.run.summary["best_val_patch_auroc"] = float(best_val_patch_auroc)
-                        wandb.run.summary["best_epoch"] = int(best_epoch)
+                    run_log.summary("best_val_image_auroc", float(best_val_image_auroc))
+                    run_log.summary("best_val_patch_auroc", float(best_val_patch_auroc))
+                    run_log.summary("best_epoch", int(best_epoch))
+                    run_log.log(
+                        {"selection/saved": 1, "selection/epoch": epoch,
+                         "selection/primary": float(primary), "selection/secondary": float(secondary)},
+                        event="selection",
+                    )
                 else:
                     detail = (
                         f"did not beat best {best_primary:.4f}" if not tied
@@ -863,10 +955,14 @@ def main() -> None:
         payload["normal_fit"] = report
         torch.save(payload, path)
         logger.info(f"  {name}: {report}")
+        run_log.log(
+            {f"final_fit/{name.replace('.pt', '')}/{k}": v for k, v in report.items()},
+            event="final_fit",
+        )
 
-    if use_wandb:
-        wandb.finish()
-    logger.info("Training complete.")
+    run_log.summary("final_bank_size", float(last_fit_report.get("bank_size", 0)))
+    run_log.finish()
+    logger.info(f"Training complete. Run record: {run_log.path}")
 
 
 if __name__ == "__main__":
