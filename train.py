@@ -124,6 +124,28 @@ def train_one_epoch(
 
         # Backward
         optimizer.zero_grad()
+
+        # A loss with no graph means the scored path produced a constant. The
+        # usual cause is that the Mahalanobis statistics were never installed,
+        # so the scorer returned its uninitialised zeros. backward() reports
+        # this as "element 0 of tensors does not require grad", which names
+        # neither the component nor the reason -- so say it here instead.
+        if not losses["total"].requires_grad:
+            stats = model.normal_stats
+            raise RuntimeError(
+                "the loss has no gradient graph, so nothing can train.\n"
+                f"  patch_scores: mean={float(patch_scores.mean()):.6g} "
+                f"min={float(patch_scores.min()):.6g} max={float(patch_scores.max()):.6g}\n"
+                f"  Mahalanobis initialised: {bool(model.mahalanobis_scorer.is_initialized)}\n"
+                f"  statistics: count={int(stats.count)} "
+                f"min_samples={stats.min_samples} ready={stats.ready} "
+                f"ever_fitted={bool(stats.ever_fitted)} "
+                f"update_frequency={stats.update_frequency}\n"
+                "If the scorer is uninitialised, no refit has happened yet: check "
+                "normal_stats.update_frequency in config/model.yaml and that the "
+                "batch supplies more than min_samples normal patches."
+            )
+
         losses["total"].backward()
 
         # ── Gradient self-check (first step only) ──────────────────────────

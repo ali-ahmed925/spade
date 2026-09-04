@@ -109,9 +109,19 @@ frequency:
 # ── Normal Statistics ──
 # 1024 patches per image (4x the old grid), so the buffer is enlarged to keep a
 # comparable number of IMAGES represented in each covariance refit.
+# ── Normal statistics during training ──
+# Exact streaming sufficient statistics (count, sum x, sum x x'), refit every
+# step. The previous deque + EMA-of-window-covariances lagged the feature space
+# by up to 100 steps, which is what made the loss exploitable by shrinking
+# features. Exact accumulators cost D + D^2 floats (1 MB at 512) and ~537 MFLOP
+# per batch, so refitting every step is affordable.
 normal_stats:
-  buffer_size: 20000                      # descriptors held for refitting
-  update_frequency: 100                   # steps between statistics updates
+  buffer_size: 20000                      # legacy; unused by the streaming path
+  update_frequency: 1                     # steps between refits
+  # Pin the scored descriptor's output LayerNorm to (weight=1, bias=0). It then
+  # emits ||x - mean|| = sqrt(D) exactly, so NO parameter can globally rescale
+  # it and the shrinkage exploit is removed structurally.
+  freeze_output_scale: true
 
 # ── LLM Projection ──
 projection:

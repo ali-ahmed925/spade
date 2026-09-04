@@ -133,13 +133,29 @@ class MahalanobisScoring(nn.Module):
         average of window-covariances rather than a covariance.
         """
         sigma64 = sigma.to(torch.float64)
-        try:
-            cholesky = torch.linalg.cholesky(sigma64)
-            sigma_inv = torch.cholesky_inverse(cholesky)
-        except RuntimeError:
-            # Singular under the current regularisation: keep the previous
-            # statistics rather than installing a scorer that returns garbage.
-            return
+
+        # Escalate the ridge until the covariance is genuinely positive definite,
+        # rather than returning quietly. A silent no-op here leaves the scorer
+        # uninitialised, which makes it emit constant zeros, which strips the
+        # graph from the loss, which surfaces as "element 0 of tensors does not
+        # require grad" in backward() -- an error that points nowhere near the
+        # cause. Failing loudly is strictly better than that.
+        eye = torch.eye(self.feature_dim, device=sigma64.device, dtype=sigma64.dtype)
+        scale = float(torch.diagonal(sigma64).mean().clamp_min(1e-12))
+        for attempt in range(5):
+            try:
+                cholesky = torch.linalg.cholesky(sigma64 + (0.0 if attempt == 0 else scale * 10.0 ** (attempt - 5)) * eye)
+                sigma_inv = torch.cholesky_inverse(cholesky)
+                break
+            except RuntimeError:
+                continue
+        else:
+            raise RuntimeError(
+                f"covariance is not positive definite even after escalating the "
+                f"ridge to {scale * 1e-1:.3g} (mean diagonal {scale:.3g}). The "
+                f"descriptors are degenerate; raise scoring.mahalanobis_reg or "
+                f"check for collapsed features."
+            )
         self.mu.data = mu.to(self.mu.dtype)
         self.sigma_inv.data = sigma_inv.to(self.sigma_inv.dtype)
         self.is_initialized.data = torch.tensor(True, device=self.mu.device)

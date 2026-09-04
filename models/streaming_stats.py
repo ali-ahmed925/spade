@@ -80,6 +80,13 @@ class StreamingGaussianEstimator(nn.Module):
         self.min_samples = int(min_samples_factor * feature_dim)
 
         self.register_buffer("count", torch.zeros(()))
+        # Whether statistics have EVER been installed. The first refit must not
+        # wait for a multiple of update_frequency: until it happens the scorer
+        # returns constant zeros, the loss has no graph, and backward() dies
+        # with "element 0 of tensors does not require grad" -- an error that
+        # says nothing about the real cause. A stale update_frequency in config
+        # produced exactly that.
+        self.register_buffer("ever_fitted", torch.tensor(False))
         self.register_buffer("sum_x", torch.zeros(feature_dim))
         self.register_buffer("sum_outer", torch.zeros(feature_dim, feature_dim))
         self.register_buffer("step", torch.zeros((), dtype=torch.long))
@@ -92,6 +99,9 @@ class StreamingGaussianEstimator(nn.Module):
         self.sum_x.zero_()
         self.sum_outer.zero_()
         self.step.zero_()
+        # `ever_fitted` is deliberately NOT cleared: the scorer keeps the last
+        # good statistics across the epoch boundary, so scores stay defined
+        # while the new epoch's accumulators fill up.
 
     @property
     def ready(self) -> bool:
@@ -152,9 +162,19 @@ class StreamingGaussianEstimator(nn.Module):
 
     @torch.no_grad()
     def should_refit(self) -> bool:
-        """Advance the step counter and say whether this step refits."""
+        """Advance the step counter and say whether this step refits.
+
+        The FIRST refit fires as soon as enough samples exist, regardless of
+        update_frequency, because before it the model cannot produce a
+        differentiable score at all.
+        """
         self.step += 1
-        return self.ready and int(self.step) % self.update_frequency == 0
+        if not self.ready:
+            return False
+        if not bool(self.ever_fitted):
+            self.ever_fitted.fill_(True)
+            return True
+        return int(self.step) % self.update_frequency == 0
 
     def extra_repr(self) -> str:
         return (

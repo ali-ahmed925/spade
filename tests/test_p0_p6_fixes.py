@@ -363,3 +363,56 @@ def test_grid_reshape_round_trips():
     aggregator = NeighborhoodAggregator(grid_size=grid, kernel_size=1)
     x = torch.randn(2, grid * grid, dim)
     assert torch.equal(aggregator(x), x), "kernel 1 must be a pure identity"
+
+
+# ═══════════ regression: the config typo that killed a run ═══════════
+def test_first_refit_does_not_wait_for_update_frequency():
+    """config/model.yaml shipped update_frequency=100 while the code assumed 1.
+    Step 1 % 100 != 0, so no refit ever happened, the scorer stayed
+    uninitialised, returned constant zeros, and backward() died with
+    'element 0 of tensors does not require grad'.
+
+    The first refit must fire as soon as enough samples exist, whatever the
+    frequency, because before it the model cannot produce a differentiable
+    score at all.
+    """
+    estimator = StreamingGaussianEstimator(feature_dim=64, update_frequency=100)
+    estimator.update(torch.randn(500, 64))
+    assert estimator.ready
+    assert estimator.should_refit() is True, "the first refit must not be gated"
+    assert estimator.should_refit() is False, "subsequent ones respect the frequency"
+
+
+def test_reset_keeps_ever_fitted_so_scores_stay_defined():
+    """Across an epoch boundary the accumulators clear but the scorer keeps its
+    last good statistics, so there is no window of graph-less zeros."""
+    estimator = StreamingGaussianEstimator(feature_dim=32, update_frequency=1)
+    estimator.update(torch.randn(200, 32))
+    estimator.should_refit()
+    estimator.reset()
+    assert int(estimator.count) == 0
+    assert bool(estimator.ever_fitted), "must not forget that a fit ever happened"
+
+
+def test_set_statistics_recovers_from_a_rank_deficient_covariance():
+    """Escalating ridge rather than a silent return: a no-op here leaves the
+    scorer uninitialised and the failure surfaces far away, in backward()."""
+    torch.manual_seed(0)
+    scorer = MahalanobisScoring(feature_dim=8, regularization=0.0, gamma=1.0)
+    x = torch.randn(100, 3) @ torch.randn(3, 8)          # rank 3 of 8
+    scorer.set_statistics(x.mean(0), torch.cov(x.T))
+
+    assert bool(scorer.is_initialized)
+    assert bool((scorer(x[:3].unsqueeze(0)) != 0).any())
+
+
+def test_config_declares_the_update_frequency_the_code_needs():
+    """The value that was wrong. Asserted against the file, not the default."""
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    config = yaml.safe_load((root / "config" / "model.yaml").read_text())
+    assert config["normal_stats"]["update_frequency"] == 1
+    assert config["normal_stats"]["freeze_output_scale"] is True
