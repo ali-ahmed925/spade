@@ -191,9 +191,14 @@ class CoresetMemoryBank(nn.Module):
         # ~5e-4 rather than 0. That is far below the mean nearest-neighbour
         # distance the stream is normalised by, so it does not affect ranking --
         # but it is why the tests assert against a scale rather than exact zero.
-        bank = self.bank.to(queries.dtype)
+        # Distances are computed in float32, never in the query dtype. With
+        # local_source="raw" the features are the backbone's fp16 tokens, and
+        # torch.cdist has no CUDA Half kernel -- it only survives fp16 when the
+        # matrix-multiply path kicks in, which needs a side with >25 rows.
+        # Promoting is also strictly more accurate for a distance.
+        bank = self.bank.float()
         k = min(self.k, bank.shape[0])
-        flat = queries.reshape(b * n, d)
+        flat = queries.reshape(b * n, d).float()
 
         scores = []
         for start in range(0, flat.shape[0], self.query_chunk):
@@ -204,7 +209,7 @@ class CoresetMemoryBank(nn.Module):
             else:
                 scores.append(distances.topk(k, dim=1, largest=False).values.mean(dim=1))
 
-        return torch.cat(scores, dim=0).view(b, n)
+        return torch.cat(scores, dim=0).view(b, n).to(queries.dtype)
 
     @torch.no_grad()
     def patchcore_reweight(
@@ -255,7 +260,12 @@ class CoresetMemoryBank(nn.Module):
         if not self.fitted:
             return patch_scores.max(dim=1).values
 
-        bank = self.bank.to(queries.dtype)
+        # float32 throughout: the neighbourhood comparison is (1, D) against
+        # (b, D) with b=9, far below the 25-row threshold that lets cdist use
+        # its Half-capable matrix-multiply path.
+        bank = self.bank.float()
+        queries = queries.float()
+        patch_scores = patch_scores.float()
         b_eff = min(b, bank.shape[0])
         out = []
         for i in range(queries.shape[0]):

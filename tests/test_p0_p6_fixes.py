@@ -416,3 +416,42 @@ def test_config_declares_the_update_frequency_the_code_needs():
     config = yaml.safe_load((root / "config" / "model.yaml").read_text())
     assert config["normal_stats"]["update_frequency"] == 1
     assert config["normal_stats"]["freeze_output_scale"] is True
+
+
+# ═══════════ regression: fp16 features from the raw pathway ═══════════
+def test_bank_scores_half_precision_features():
+    """local_source="raw" banks the backbone's fp16 tokens directly -- the
+    "fused" path calls .float() and hid this. torch.cdist has no CUDA Half
+    kernel; it only survives fp16 via its matrix-multiply path, which needs a
+    side with more than 25 rows."""
+    torch.manual_seed(0)
+    bank = CoresetMemoryBank(feature_dim=32, coreset_ratio=1.0)
+    bank.fit(torch.randn(200, 32))
+
+    scores = bank(torch.randn(1, 40, 32, dtype=torch.float16))
+    assert scores.dtype == torch.float16, "output dtype must follow the input"
+    assert torch.isfinite(scores).all()
+
+
+def test_patchcore_reweight_survives_the_small_neighbourhood_path():
+    """The exact crash: (1, D) against (b=9, D) is below cdist's 25-row
+    threshold, so it drops to the direct kernel that has no Half support."""
+    torch.manual_seed(0)
+    bank = CoresetMemoryBank(feature_dim=32, coreset_ratio=1.0)
+    bank.fit(torch.randn(200, 32))
+
+    queries = torch.randn(2, 40, 32, dtype=torch.float16)
+    reweighted = bank.patchcore_reweight(queries, bank(queries), b=9)
+    assert reweighted.shape == (2,)
+    assert torch.isfinite(reweighted).all()
+
+
+def test_half_and_float_scores_agree():
+    """Promoting to float32 must not change the answer beyond fp16 input noise."""
+    torch.manual_seed(0)
+    bank = CoresetMemoryBank(feature_dim=16, coreset_ratio=1.0)
+    normal = torch.randn(100, 16)
+    bank.fit(normal)
+
+    q = torch.randn(1, 20, 16)
+    assert torch.allclose(bank(q).float(), bank(q.half()).float(), atol=2e-2)
