@@ -67,7 +67,10 @@ def train_one_epoch(
         running["pseudo"] = 0.0
     if criterion.grounding_loss_fn is not None:
         running["grounding"] = 0.0
+    if criterion.collapse_loss_fn is not None:
+        running["collapse"] = 0.0
     last_grounding_diagnostics: dict[str, float] = {}
+    last_collapse_diagnostics: dict[str, float] = {}
     num_batches = 0
     global_step = (epoch - 1) * len(loader)
 
@@ -121,6 +124,8 @@ def train_one_epoch(
             labels=labels,  # All zeros for normal-only training
             patch_scores_perturbed=outputs.get("patch_scores_perturbed"),
             patch_query_attention=outputs.get("patch_query_attention"),
+            descriptors=outputs["descriptors"],
+            local_features=outputs.get("local_features"),
         )
 
         # Backward
@@ -176,6 +181,8 @@ def train_one_epoch(
                 running[k] += float(losses[k].detach())
         if "grounding_diagnostics" in losses:
             last_grounding_diagnostics = losses["grounding_diagnostics"]
+        if "collapse_diagnostics" in losses:
+            last_collapse_diagnostics = losses["collapse_diagnostics"]
         num_batches += 1
         
         # Clear intermediate tensors
@@ -209,6 +216,9 @@ def train_one_epoch(
                 if "grounding" in running:
                     log_dict["train/loss_grounding"] = running["grounding"] / num_batches
                     log_dict.update({f"train/{k}": v for k, v in last_grounding_diagnostics.items()})
+                if "collapse" in running:
+                    log_dict["train/loss_collapse"] = running["collapse"] / num_batches
+                    log_dict.update({f"train/{k}": v for k, v in last_collapse_diagnostics.items()})
                 if torch.cuda.is_available():
                     log_dict["sys/gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 2**30
                 run_log.log(log_dict, step=current_step, event="step")
@@ -590,6 +600,8 @@ def main() -> None:
             grounding_weight=grounding_weight,
             grounding_queries=loss_cfg.get("grounding_queries", 4),
             grounding_pos_weight=loss_cfg.get("grounding_pos_weight", "auto"),
+        collapse_variance_weight=float(cfg["loss"].get("collapse_variance_weight", 0.0)),
+        collapse_covariance_weight=float(cfg["loss"].get("collapse_covariance_weight", 0.0)),
         )
         logger.info(
             f"Using Mahalanobis clustering loss for normal-only training "

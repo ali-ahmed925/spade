@@ -8,6 +8,7 @@ Supports two modes:
 import torch
 import torch.nn as nn
 
+from losses.collapse_loss import AntiCollapseLoss
 from losses.grounding_loss import QueryGroundingLoss
 from losses.patch_loss import PatchBCELoss, FocalLoss
 from losses.patch_loss_normal import MahalanobisPatchLoss, PseudoAnomalyLoss
@@ -38,6 +39,9 @@ class TotalLoss(nn.Module):
         grounding_weight: float = 0.0,
         grounding_queries: int = 4,
         grounding_pos_weight: float | str = "auto",
+        # ── anti-collapse regularisation ──
+        collapse_variance_weight: float = 0.0,
+        collapse_covariance_weight: float = 0.0,
     ) -> None:
         """
         Args:
@@ -59,6 +63,19 @@ class TotalLoss(nn.Module):
         # touch the detection term: the anomaly score never sees a synthetic
         # label. weight == 0 disables it entirely, which is the exact control
         # for any comparison.
+        # Anti-collapse. Without it EVERY term in the detection objective is
+        # minimised by discarding dimensions: mean Mahalanobis equals the
+        # effective rank, var(s) is ~2x it, and the pseudo margin gets easier as
+        # Sigma^-1 blows up in the emptied directions. Measured on screw: rank
+        # 9.3 -> 2.3 over five epochs, image AUROC 0.866 -> 0.774.
+        self.collapse_loss_fn = (
+            AntiCollapseLoss(
+                variance_weight=collapse_variance_weight,
+                covariance_weight=collapse_covariance_weight,
+            )
+            if (collapse_variance_weight > 0 or collapse_covariance_weight > 0)
+            else None
+        )
         self.grounding_weight = float(grounding_weight)
         self.grounding_loss_fn = (
             QueryGroundingLoss(
@@ -95,6 +112,8 @@ class TotalLoss(nn.Module):
         labels: torch.Tensor,
         patch_scores_perturbed: torch.Tensor | None = None,
         patch_query_attention: torch.Tensor | None = None,
+        descriptors: torch.Tensor | None = None,
+        local_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -139,6 +158,24 @@ class TotalLoss(nn.Module):
         # Gradients flow through the contextualizer into the Q-Former, so the
         # query tokens actually learn; the detection term above is unchanged.
         result["detection"] = result["total"]
+
+        # ── anti-collapse, on every representation that feeds a scorer ──
+        # The descriptor feeds Mahalanobis and the local features feed the
+        # memory bank, so both must keep their dimensions. Constrains the
+        # representation only: no labels, no anomalies, no test data.
+        if self.collapse_loss_fn is not None:
+            collapse_total = None
+            diagnostics: dict[str, float] = {}
+            for name, tensor in (("descriptor", descriptors), ("local", local_features)):
+                if tensor is None:
+                    continue
+                value, stats = self.collapse_loss_fn(tensor)
+                collapse_total = value if collapse_total is None else collapse_total + value
+                diagnostics.update({f"{k}_{name}": v for k, v in stats.items()})
+            if collapse_total is not None:
+                result["collapse"] = collapse_total
+                result["collapse_diagnostics"] = diagnostics
+                result["total"] = result["total"] + collapse_total
         if self.grounding_loss_fn is not None:
             if patch_query_attention is None:
                 raise ValueError(

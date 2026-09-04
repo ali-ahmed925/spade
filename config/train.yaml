@@ -116,6 +116,39 @@ loss:
   # control — no synthetic images are generated, so training is bit-identical
   # to a pre-grounding run.
   grounding_weight: 0.0        # lambda; try 0.05 / 0.1 / 0.5 in a sweep
+
+  # ── Anti-collapse regularisation (VICReg variance + covariance) ──
+  # Every term in the normal-only detection objective is minimised by
+  # discarding dimensions. With statistics refit to match the features,
+  #     E[(x-mu)' Sigma^-1 (x-mu)] = sum_i sigma_i/(sigma_i + lambda)
+  #                                = the EFFECTIVE RANK
+  # measured: rank 512 -> loss 505, rank 64 -> 64, rank 8 -> 8, rank 2 -> 2.
+  # var(s) is ~2x the same quantity, and the pseudo margin gets EASIER as
+  # Sigma^-1 blows up in the emptied directions. On screw this drove the
+  # descriptor from rank 9.3 to 2.3 over five epochs while image AUROC fell
+  # 0.866 -> 0.774.
+  #
+  # These two terms make discarding a dimension cost something. Both 0.0 is the
+  # EXACT control -- no AntiCollapseLoss is constructed and the objective is
+  # bit-identical to the pre-fix one.
+  #
+  # The 25:1 ratio is VICReg's. The absolute scale is a STARTING POINT chosen so
+  # both terms are comparable to the detection loss (~2), not a tuned value:
+  # train/collapse_variance_* and train/collapse_covariance_* are logged every
+  # step so their real magnitudes are visible, and the geometry line reports
+  # local_effective_rank each epoch. Adjust from those, on val, never on heldout.
+  # THE WEIGHT IS THE OPEN QUESTION, not a solved value. There is a real
+  # tension: too weak and collapse proceeds anyway (measured on a toy, VICReg's
+  # nominal scale only lifted effective rank 21 -> 27 out of 64); too strong and
+  # the term dominates detection and the model optimises for spread rather than
+  # for anomalies. At weight 5.0 the collapse term measured ~7x the detection
+  # loss, which is far too strong to ship as a default.
+  #
+  # 1.0 / 0.04 keeps it at roughly half the detection loss at the start of
+  # training. Run scripts/collapse_sweep.sh to choose from evidence -- on VAL,
+  # never on heldout -- exactly as the grounding lambda sweep was run.
+  collapse_variance_weight: 1.0
+  collapse_covariance_weight: 0.04
   grounding_queries: 4         # leading query tokens reserved for anomalies
   grounding_synthetic_prob: 0.5  # fraction of training images given a synthetic defect
   grounding_pos_weight: "auto"   # anomalous patches are a small minority
