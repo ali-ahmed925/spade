@@ -28,6 +28,7 @@ from utils.logging import get_logger, run_log_path
 from utils.run_logger import RunLogger
 from utils.seed import set_seed
 from utils.early_stopping import EarlyStopping
+from utils.metrics import compute_image_auroc
 from utils.selection import should_save_checkpoint
 from models.normal_fit import fit_normal_model
 from utils.checkpoint import load_checkpoint_into
@@ -218,6 +219,18 @@ def train_one_epoch(
         summary.update(last_grounding_diagnostics)
     return summary
 
+def _safe_auroc(labels: np.ndarray, scores: np.ndarray) -> float:
+    """AUROC, or nan when the split has only one class.
+
+    `roc_auc_score` raises in that case. A validation split that happens to be
+    all-normal must not abort a 20-epoch run.
+    """
+    labels = np.asarray(labels)
+    if labels.size == 0 or np.unique(labels).size < 2:
+        return float("nan")
+    return compute_image_auroc(labels, np.asarray(scores))
+
+
 @torch.no_grad()
 def validate(
     model: SPADE,
@@ -274,16 +287,16 @@ def validate(
 
     has_patch_defects = patch_labels_arr.size > 0 and (patch_labels_arr > 0).any()
     metrics = {
-        "val/image_auroc": compute_image_auroc(labels_arr, scores_arr),
+        "val/image_auroc": _safe_auroc(labels_arr, scores_arr),
         "val/patch_auroc": (
-            compute_image_auroc((patch_labels_arr > 0).astype(np.int64), patch_scores_arr)
+            _safe_auroc((patch_labels_arr > 0).astype(np.int64), patch_scores_arr)
             if has_patch_defects else float("nan")
         ),
     }
 
     # Per-stream AUROC: which part of the detector is carrying the result.
     for name, values in stream_scores.items():
-        metrics[f"val/stream_{name}"] = compute_image_auroc(labels_arr, np.array(values))
+        metrics[f"val/stream_{name}"] = _safe_auroc(labels_arr, np.array(values))
 
     # Separability, the quantity every earlier failure analysis turned on:
     # normal images score X, anomalous score Y, the ratio is defect elevation,
